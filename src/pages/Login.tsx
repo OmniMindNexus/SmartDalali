@@ -34,12 +34,18 @@ export default function Login() {
 
   // Redirect if already logged in
   if (user) {
-    if (user.role === "superuser") {
-      navigate("/admin");
-    } else if (user.role === "agent") {
-      navigate("/agent");
-    } else {
-      navigate("/");
+    switch (user.role) {
+      case "superuser":
+        navigate("/admin");
+        break;
+      case "agent":
+        navigate("/agent");
+        break;
+      case "user":
+        navigate("/dashboard");
+        break;
+      default:
+        navigate("/");
     }
     return null;
   }
@@ -58,12 +64,18 @@ export default function Login() {
       });
 
       // Redirect based on role
-      if (user.role === "superuser") {
-        navigate("/admin");
-      } else if (user.role === "agent") {
-        navigate("/agent");
-      } else {
-        navigate("/");
+      switch (user.role) {
+        case "superuser":
+          navigate("/admin");
+          break;
+        case "agent":
+          navigate("/agent");
+          break;
+        case "user":
+          navigate("/dashboard");
+          break;
+        default:
+          navigate("/");
       }
     } catch (err: any) {
       setError(err.message || "Login failed. Please try again.");

@@ -12,9 +12,11 @@ import Home from "./pages/Home";
 import Properties from "./pages/Properties";
 import MapView from "./pages/MapView";
 import Login from "./pages/Login";
+import UserDashboard from "./pages/UserDashboard";
 import AgentDashboard from "./pages/AgentDashboard";
 import AdminDashboard from "./pages/AdminDashboard";
 import NotFound from "./pages/NotFound";
+import { Header } from "./components/Header";
 
 const queryClient = new QueryClient();
 
@@ -28,7 +30,11 @@ function ProtectedRoute({
   const { user, isLoading } = useAuth();
 
   if (isLoading) {
-    return <div className="min-h-screen flex items-center justify-center">Loading...</div>;
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-pulse">Loading...</div>
+      </div>
+    );
   }
 
   if (!user) {
@@ -42,6 +48,25 @@ function ProtectedRoute({
   return <>{children}</>;
 }
 
+function DashboardRedirect() {
+  const { user } = useAuth();
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
+
+  switch (user.role) {
+    case "superuser":
+      return <Navigate to="/admin" replace />;
+    case "agent":
+      return <Navigate to="/agent" replace />;
+    case "user":
+      return <Navigate to="/dashboard" replace />;
+    default:
+      return <Navigate to="/" replace />;
+  }
+}
+
 function AppRoutes() {
   const { user } = useAuth();
 
@@ -50,21 +75,24 @@ function AppRoutes() {
       <div className="flex min-h-screen w-full">
         <AppSidebar />
         <div className="flex-1 flex flex-col">
-          <header className="h-14 border-b flex items-center px-4 gap-2 sticky top-0 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
-            <SidebarTrigger />
-            <div className="flex-1" />
-            {user && (
-              <span className="text-sm text-muted-foreground">
-                Welcome, {user.name}
-              </span>
-            )}
-          </header>
+          <Header />
           <main className="flex-1">
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/properties" element={<Properties />} />
               <Route path="/map" element={<MapView />} />
-              <Route path="/login" element={<Login />} />
+              <Route 
+                path="/login" 
+                element={user ? <DashboardRedirect /> : <Login />} 
+              />
+              <Route
+                path="/dashboard/*"
+                element={
+                  <ProtectedRoute allowedRoles={["user"]}>
+                    <UserDashboard />
+                  </ProtectedRoute>
+                }
+              />
               <Route
                 path="/agent/*"
                 element={

@@ -35,12 +35,14 @@ export function AppSidebar() {
     ];
 
     if (user?.role === "superuser") {
-      baseItems.push({ title: "Admin Dashboard", url: "/admin", icon: LayoutDashboard });
+      baseItems.unshift({ title: "Admin Dashboard", url: "/admin", icon: LayoutDashboard });
       baseItems.push({ title: "Users", url: "/admin/users", icon: Users });
       baseItems.push({ title: "Settings", url: "/admin/settings", icon: Settings });
     } else if (user?.role === "agent") {
-      baseItems.push({ title: "My Dashboard", url: "/agent", icon: LayoutDashboard });
+      baseItems.unshift({ title: "My Dashboard", url: "/agent", icon: LayoutDashboard });
       baseItems.push({ title: "My Listings", url: "/agent/listings", icon: Building2 });
+    } else if (user?.role === "user") {
+      baseItems.unshift({ title: "My Dashboard", url: "/dashboard", icon: LayoutDashboard });
     }
 
     return baseItems;
