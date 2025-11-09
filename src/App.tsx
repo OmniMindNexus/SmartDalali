@@ -17,6 +17,7 @@ import UserDashboard from "./pages/UserDashboard";
 import AgentDashboard from "./pages/AgentDashboard";
 import AdminDashboard from "./pages/AdminDashboard";
 import NotFound from "./pages/NotFound";
+import PropertyForm from "./pages/PropertyForm";
 import { Header } from "./components/Header";
 
 const queryClient = new QueryClient();
@@ -100,6 +101,22 @@ function AppRoutes() {
                 element={
                   <ProtectedRoute allowedRoles={["agent"]}>
                     <AgentDashboard />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/properties/new"
+                element={
+                  <ProtectedRoute allowedRoles={["agent"]}>
+                    <PropertyForm />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/properties/:id/edit"
+                element={
+                  <ProtectedRoute allowedRoles={["agent"]}>
+                    <PropertyForm />
                   </ProtectedRoute>
                 }
               />
