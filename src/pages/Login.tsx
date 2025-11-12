@@ -56,27 +56,15 @@ export default function Login() {
     setLoading(true);
 
     try {
-      const user = await login(loginEmail, loginPassword);
+      await login(loginEmail, loginPassword);
       
       toast({
         title: t("loginSuccess"),
-        description: `${t("welcome")}, ${user.name}!`,
+        description: `${t("welcome")}!`,
       });
 
-      // Redirect based on role
-      switch (user.role) {
-        case "superuser":
-          navigate("/admin");
-          break;
-        case "agent":
-          navigate("/agent");
-          break;
-        case "user":
-          navigate("/dashboard");
-          break;
-        default:
-          navigate("/");
-      }
+      // Navigation will be handled by the App component based on user role
+      navigate("/");
     } catch (err: any) {
       setError(err.message || "Login failed. Please try again.");
     } finally {
@@ -107,11 +95,11 @@ export default function Login() {
     setLoading(true);
 
     try {
-      await register(registerUsername, registerEmail, registerPassword1, registerPassword2);
+      await register(registerEmail, registerPassword1, registerUsername, registerUsername);
       
       toast({
         title: "Registration Successful",
-        description: "Your account has been created. Please check your email to activate it.",
+        description: "Your account has been created. You can now log in.",
       });
       
       // Switch to login tab
@@ -161,51 +149,10 @@ export default function Login() {
                   </Alert>
                 )}
 
-                {/* Mock Users Info */}
                 <Alert className="bg-primary/5 border-primary/20">
                   <AlertDescription className="text-xs">
-                    <div className="font-semibold mb-2">Demo Accounts:</div>
-                    <div className="space-y-1 font-mono">
-                      <div className="flex items-center gap-2">
-                        <span className="text-blue-500">👑 Admin:</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setLoginEmail("admin@smartdalali.com");
-                            setLoginPassword("admin123");
-                          }}
-                          className="text-xs underline hover:text-primary"
-                        >
-                          admin@smartdalali.com / admin123
-                        </button>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-green-500">🏢 Agent:</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setLoginEmail("agent@smartdalali.com");
-                            setLoginPassword("agent123");
-                          }}
-                          className="text-xs underline hover:text-primary"
-                        >
-                          agent@smartdalali.com / agent123
-                        </button>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-purple-500">👤 User:</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setLoginEmail("user@smartdalali.com");
-                            setLoginPassword("user123");
-                          }}
-                          className="text-xs underline hover:text-primary"
-                        >
-                          user@smartdalali.com / user123
-                        </button>
-                      </div>
-                    </div>
+                    <div className="font-semibold mb-2">Create an account to get started</div>
+                    <p>Register with your email and password to access all features.</p>
                   </AlertDescription>
                 </Alert>
 

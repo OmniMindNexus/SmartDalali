@@ -22,10 +22,6 @@ function AgentOverview() {
   
   const agentProperties = mockProperties.filter((p) => p.agentId === user?.id);
   
-  const trialDaysLeft = user?.trialEndsAt
-    ? Math.ceil((new Date(user.trialEndsAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24))
-    : 0;
-
   const monthlyPrice = 50000;
   const annualPrice = 500000;
   const totalViews = 1234;
@@ -84,33 +80,6 @@ function AgentOverview() {
           Add Property
         </Button>
       </div>
-
-      {/* Trial Status Alert */}
-      {user?.subscriptionActive && trialDaysLeft > 0 && (
-        <Card className={`${trialDaysLeft <= 7 ? "border-destructive bg-destructive/5" : "border-primary bg-primary/5"}`}>
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="font-semibold mb-1 flex items-center gap-2">
-                  {trialDaysLeft <= 7 ? "⚠️ Trial Ending Soon" : "🎉 Free Trial Active"}
-                  <Badge variant={trialDaysLeft <= 7 ? "destructive" : "default"}>
-                    {trialDaysLeft} days left
-                  </Badge>
-                </h3>
-                <p className="text-sm text-muted-foreground">
-                  Your trial expires on{" "}
-                  {user?.trialEndsAt
-                    ? new Date(user.trialEndsAt).toLocaleDateString()
-                    : "N/A"}
-                </p>
-              </div>
-              <Button onClick={() => handleUpgrade("monthly")}>
-                Upgrade Now
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
 
       {/* Stats Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
