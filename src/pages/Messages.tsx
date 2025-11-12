@@ -42,26 +42,29 @@ export default function Messages() {
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
 
-  // Fetch conversations
   useEffect(() => {
     if (!user) return;
 
     const fetchConversations = async () => {
-      const { data, error } = await supabase
-        .from("conversations")
-        .select("*")
-        .or(`user_id.eq.${user.id},agent_id.eq.${user.id}`)
-        .order("updated_at", { ascending: false });
+      try {
+        const { data, error } = await supabase
+          .from("conversations")
+          .select("*")
+          .or(`user_id.eq.${user.id},agent_id.eq.${user.id}`)
+          .order("updated_at", { ascending: false });
 
-      if (error) {
+        if (error) {
+          console.error("Error fetching conversations:", error);
+          toast({
+            title: "Error",
+            description: "Failed to load conversations",
+            variant: "destructive",
+          });
+        } else {
+          setConversations(data || []);
+        }
+      } catch (error) {
         console.error("Error fetching conversations:", error);
-        toast({
-          title: "Error",
-          description: "Failed to load conversations",
-          variant: "destructive",
-        });
-      } else {
-        setConversations(data || []);
       }
       setLoading(false);
     };

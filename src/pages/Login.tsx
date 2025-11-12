@@ -95,7 +95,7 @@ export default function Login() {
     setLoading(true);
 
     try {
-      await register(registerEmail, registerPassword1, registerUsername, registerUsername);
+      await register(registerUsername, registerEmail, registerPassword1);
       
       toast({
         title: "Registration Successful",

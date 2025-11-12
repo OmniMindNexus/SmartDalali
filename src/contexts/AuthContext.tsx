@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from "react";
 import { supabase } from "@/integrations/supabase/client";
-import type { User as SupabaseUser, Session } from "@supabase/supabase-js";
+import type { User as SupabaseUser } from "@supabase/supabase-js";
 
 export type UserRole = "superuser" | "agent" | "user";
 
@@ -15,139 +15,137 @@ export interface User {
 
 interface AuthContextType {
   user: User | null;
-  session: Session | null;
   isLoading: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<User>;
   logout: () => Promise<void>;
-  register: (email: string, password: string, username: string, name: string) => Promise<void>;
+  register: (username: string, email: string, password: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
-  const [session, setSession] = useState<Session | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-
-  const fetchUserProfile = async (userId: string) => {
-    try {
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", userId)
-        .single();
-
-      const { data: roles } = await supabase
-        .from("user_roles")
-        .select("role")
-        .eq("user_id", userId);
-
-      const userRole: UserRole = roles?.find(r => r.role === "superuser")
-        ? "superuser"
-        : roles?.find(r => r.role === "agent")
-        ? "agent"
-        : "user";
-
-      return {
-        profile,
-        role: userRole,
-      };
-    } catch (error) {
-      console.error("Error fetching user profile:", error);
-      return null;
-    }
-  };
 
   useEffect(() => {
     // Get initial session
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
       if (session?.user) {
-        setTimeout(() => {
-          fetchUserProfile(session.user.id).then((data) => {
-            if (data) {
-              setUser({
-                id: session.user.id,
-                email: session.user.email!,
-                username: data.profile?.username || session.user.email!.split("@")[0],
-                name: data.profile?.name || session.user.email!.split("@")[0],
-                role: data.role,
-                avatarUrl: data.profile?.avatar_url,
-              });
-            }
-            setIsLoading(false);
-          });
-        }, 0);
+        fetchUserProfile(session.user);
       } else {
         setIsLoading(false);
       }
     });
 
     // Listen for auth changes
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session);
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
-        setTimeout(() => {
-          fetchUserProfile(session.user.id).then((data) => {
-            if (data) {
-              setUser({
-                id: session.user.id,
-                email: session.user.email!,
-                username: data.profile?.username || session.user.email!.split("@")[0],
-                name: data.profile?.name || session.user.email!.split("@")[0],
-                role: data.role,
-                avatarUrl: data.profile?.avatar_url,
-              });
-            }
-          });
-        }, 0);
+        fetchUserProfile(session.user);
       } else {
         setUser(null);
+        setIsLoading(false);
       }
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  const login = async (email: string, password: string): Promise<void> => {
-    const { error } = await supabase.auth.signInWithPassword({
+  const fetchUserProfile = async (authUser: SupabaseUser) => {
+    try {
+      // Get profile
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", authUser.id)
+        .maybeSingle();
+
+      // Get roles
+      const { data: roles } = await supabase
+        .from("user_roles")
+        .select("role")
+        .eq("user_id", authUser.id);
+
+      const userRole: UserRole = 
+        roles?.some(r => r.role === "superuser") ? "superuser" :
+        roles?.some(r => r.role === "agent") ? "agent" : "user";
+
+      setUser({
+        id: authUser.id,
+        email: authUser.email!,
+        username: profile?.username || authUser.email?.split("@")[0] || "",
+        name: profile?.name || authUser.email?.split("@")[0] || "",
+        role: userRole,
+        avatarUrl: profile?.avatar_url,
+      });
+    } catch (error) {
+      console.error("Error fetching user profile:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const login = async (email: string, password: string): Promise<User> => {
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
 
-    if (error) {
-      throw new Error(error.message);
-    }
+    if (error) throw error;
+    if (!data.user) throw new Error("No user returned from login");
+
+    // Get profile
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", data.user.id)
+      .maybeSingle();
+
+    // Get roles
+    const { data: roles } = await supabase
+      .from("user_roles")
+      .select("role")
+      .eq("user_id", data.user.id);
+
+    const userRole: UserRole = 
+      roles?.some(r => r.role === "superuser") ? "superuser" :
+      roles?.some(r => r.role === "agent") ? "agent" : "user";
+
+    const userObj: User = {
+      id: data.user.id,
+      email: data.user.email!,
+      username: profile?.username || data.user.email?.split("@")[0] || "",
+      name: profile?.name || data.user.email?.split("@")[0] || "",
+      role: userRole,
+      avatarUrl: profile?.avatar_url,
+    };
+
+    setUser(userObj);
+    return userObj;
   };
 
   const logout = async () => {
     await supabase.auth.signOut();
     setUser(null);
-    setSession(null);
   };
 
-  const register = async (email: string, password: string, username: string, name: string) => {
-    const { error } = await supabase.auth.signUp({
+  const register = async (username: string, email: string, password: string) => {
+    const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
-        emailRedirectTo: `${window.location.origin}/`,
         data: {
           username,
-          name,
+          name: username,
         },
       },
     });
 
-    if (error) {
-      throw new Error(error.message);
-    }
+    if (error) throw error;
+    if (!data.user) throw new Error("No user returned from registration");
   };
 
   return (
-    <AuthContext.Provider value={{ user, session, isLoading, login, logout, register }}>
+    <AuthContext.Provider value={{ user, isLoading, login, logout, register }}>
       {children}
     </AuthContext.Provider>
   );
