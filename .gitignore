@@ -1,0 +1,66 @@
+# Root .gitignore for SmartDalali project
+
+# Node (frontend)
+node_modules/
+SmartDalaliTZ/node_modules/
+
+# Vite / build outputs
+dist/
+SmartDalaliTZ/dist/
+.vite/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.py[cod]
+
+# SQLite databases (local dev)
+*.sqlite3
+db.sqlite3
+db.sqlite3.bak
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Django media/uploads
+media_root/
+property_images/
+property_videos/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# OS files
+.DS_Store
+
+# Coverage / reports
+.coverage
+htmlcov/
+coverage/
+
+# TypeScript
+*.tsbuildinfo
+
+# Misc backups
+*.bak
+
+# Keep README and other project files tracked
+!README.md

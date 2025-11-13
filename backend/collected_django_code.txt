@@ -1,0 +1,3647 @@
+# --- File: ./views.py ---
+
+
+# --- File: ./utils/generate_code.py ---
+import random
+
+
+
+def generate_code(length=8):
+    return ''.join([str(random.randint(0, 9)) for _ in range(length)])
+
+# --- File: ./support/serializers.py ---
+from rest_framework import serializers
+from .models import SupportTicket, TicketReply
+from accounts.models import Profile
+
+class TicketReplySerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.username', read_only=True)
+    user_role = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = TicketReply
+        fields = ['id', 'user', 'user_name', 'user_role', 'message', 'is_admin_reply', 'created_at']
+        read_only_fields = ['user', 'is_admin_reply', 'created_at']
+    
+    def get_user_role(self, obj):
+        if obj.user.is_superuser:
+            return 'admin'
+        elif obj.user.groups.filter(name='agent').exists():
+            return 'agent'
+        else:
+            return 'user'
+
+class SupportTicketSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.username', read_only=True)
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    assigned_to_name = serializers.CharField(source='assigned_to.username', read_only=True)
+    replies = TicketReplySerializer(many=True, read_only=True)
+    reply_count = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = SupportTicket
+        fields = [
+            'id', 'ticket_number', 'user', 'user_name', 'user_email',
+            'title', 'description', 'category', 'priority', 'status',
+            'assigned_to', 'assigned_to_name', 'admin_reply', 'user_reply',
+            'created_at', 'updated_at', 'closed_at', 'replies', 'reply_count'
+        ]
+        read_only_fields = ['user', 'ticket_number', 'created_at', 'updated_at', 'closed_at']
+    
+    def get_reply_count(self, obj):
+        return obj.replies.count()
+
+class CreateSupportTicketSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SupportTicket
+        fields = ['title', 'description', 'category', 'priority']
+    
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+
+# --- File: ./support/admin.py ---
+from django.contrib import admin
+from .models import SupportTicket, TicketReply
+
+@admin.register(SupportTicket)
+class SupportTicketAdmin(admin.ModelAdmin):
+    list_display = ['ticket_number', 'title', 'user', 'category', 'priority', 'status', 'assigned_to', 'created_at']
+    list_filter = ['status', 'priority', 'category', 'created_at']
+    search_fields = ['ticket_number', 'title', 'user__username', 'user__email']
+    readonly_fields = ['ticket_number', 'created_at', 'updated_at']
+    list_editable = ['status', 'assigned_to']
+    
+    fieldsets = (
+        ('Ticket Information', {
+            'fields': ('ticket_number', 'user', 'title', 'description', 'category', 'priority', 'status')
+        }),
+        ('Assignment', {
+            'fields': ('assigned_to',)
+        }),
+        ('Replies', {
+            'fields': ('admin_reply', 'user_reply')
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at', 'closed_at'),
+            'classes': ('collapse',)
+        }),
+    )
+
+@admin.register(TicketReply)
+class TicketReplyAdmin(admin.ModelAdmin):
+    list_display = ['ticket', 'user', 'is_admin_reply', 'created_at']
+    list_filter = ['is_admin_reply', 'created_at']
+    search_fields = ['ticket__ticket_number', 'user__username', 'message']
+    readonly_fields = ['created_at']
+
+
+
+# --- File: ./support/views.py ---
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.contrib.auth.decorators import login_required
+from django.utils.decorators import method_decorator
+from django.utils import timezone
+from django.db.models import Q
+from .models import SupportTicket, TicketReply
+from .serializers import SupportTicketSerializer, CreateSupportTicketSerializer, TicketReplySerializer
+
+class SupportTicketViewSet(viewsets.ModelViewSet):
+    serializer_class = SupportTicketSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_superuser or user.is_staff:
+            # Admin can see all tickets
+            return SupportTicket.objects.all()
+        else:
+            # Users can only see their own tickets
+            return SupportTicket.objects.filter(user=user)
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return CreateSupportTicketSerializer
+        return SupportTicketSerializer
+    
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+    
+    @action(detail=True, methods=['post'])
+    def reply(self, request, pk=None):
+        ticket = self.get_object()
+        message = request.data.get('message', '')
+        
+        if not message:
+            return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if user can reply to this ticket
+        if not (ticket.user == request.user or request.user.is_superuser or request.user.is_staff):
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        reply = TicketReply.objects.create(
+            ticket=ticket,
+            user=request.user,
+            message=message,
+            is_admin_reply=request.user.is_superuser or request.user.is_staff
+        )
+        
+        # Update ticket status and user_reply field
+        if request.user == ticket.user:
+            ticket.user_reply = message
+            ticket.status = 'open'  # Reopen if user replies
+        else:
+            ticket.admin_reply = message
+            ticket.assigned_to = request.user
+            if ticket.status == 'open':
+                ticket.status = 'in_progress'
+        
+        ticket.save()
+        
+        return Response(TicketReplySerializer(reply).data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'])
+    def assign(self, request, pk=None):
+        if not (request.user.is_superuser or request.user.is_staff):
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        ticket = self.get_object()
+        assigned_to_id = request.data.get('assigned_to')
+        
+        if assigned_to_id:
+            from django.contrib.auth.models import User
+            try:
+                assigned_user = User.objects.get(id=assigned_to_id)
+                ticket.assigned_to = assigned_user
+                ticket.status = 'in_progress'
+                ticket.save()
+                return Response({'message': 'Ticket assigned successfully'})
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        return Response({'error': 'assigned_to is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=True, methods=['post'])
+    def close(self, request, pk=None):
+        if not (request.user.is_superuser or request.user.is_staff):
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        ticket = self.get_object()
+        ticket.status = 'closed'
+        ticket.closed_at = timezone.now()
+        ticket.save()
+        
+        return Response({'message': 'Ticket closed successfully'})
+    
+    @action(detail=False, methods=['get'])
+    def stats(self, request):
+        if not (request.user.is_superuser or request.user.is_staff):
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        from django.db.models import Count
+        from django.utils import timezone
+        
+        stats = {
+            'total_tickets': SupportTicket.objects.count(),
+            'open_tickets': SupportTicket.objects.filter(status='open').count(),
+            'in_progress_tickets': SupportTicket.objects.filter(status='in_progress').count(),
+            'resolved_tickets': SupportTicket.objects.filter(status='resolved').count(),
+            'closed_tickets': SupportTicket.objects.filter(status='closed').count(),
+            'tickets_by_priority': dict(SupportTicket.objects.values('priority').annotate(count=Count('id')).values_list('priority', 'count')),
+            'tickets_by_category': dict(SupportTicket.objects.values('category').annotate(count=Count('id')).values_list('category', 'count')),
+        }
+        
+        return Response(stats)
+
+
+# --- File: ./support/urls.py ---
+from rest_framework.routers import DefaultRouter
+from .views import SupportTicketViewSet
+
+router = DefaultRouter()
+router.register(r'tickets', SupportTicketViewSet, basename='support-ticket')
+
+urlpatterns = router.urls
+
+
+
+# --- File: ./support/apps.py ---
+from django.apps import AppConfig
+
+
+class SupportConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'support'
+
+
+
+# --- File: ./support/models.py ---
+from django.db import models
+from django.conf import settings
+from django.utils import timezone
+import uuid
+
+class SupportTicket(models.Model):
+    PRIORITY_CHOICES = (
+        ('low', 'Low'),
+        ('medium', 'Medium'),
+        ('high', 'High'),
+        ('urgent', 'Urgent'),
+    )
+    
+    STATUS_CHOICES = (
+        ('open', 'Open'),
+        ('in_progress', 'In Progress'),
+        ('resolved', 'Resolved'),
+        ('closed', 'Closed'),
+    )
+    
+    CATEGORY_CHOICES = (
+        ('account', 'Account Issues'),
+        ('property', 'Property Listing'),
+        ('payment', 'Payment & Billing'),
+        ('technical', 'Technical Support'),
+        ('report', 'Report a Problem'),
+        ('feature', 'Feature Request'),
+        ('other', 'Other'),
+    )
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    ticket_number = models.CharField(max_length=20, unique=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='support_tickets')
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES)
+    priority = models.CharField(max_length=10, choices=PRIORITY_CHOICES, default='medium')
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='open')
+    assigned_to = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_tickets')
+    admin_reply = models.TextField(blank=True, null=True)
+    user_reply = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
+    def save(self, *args, **kwargs):
+        if not self.ticket_number:
+            self.ticket_number = f"SD-{timezone.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
+        super().save(*args, **kwargs)
+    
+    def __str__(self):
+        return f"{self.ticket_number} - {self.title}"
+
+class TicketReply(models.Model):
+    ticket = models.ForeignKey(SupportTicket, on_delete=models.CASCADE, related_name='replies')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    message = models.TextField()
+    is_admin_reply = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['created_at']
+    
+    def __str__(self):
+        return f"Reply to {self.ticket.ticket_number} by {self.user.username}"
+
+
+
+# --- File: ./payments/serializers.py ---
+from rest_framework import serializers
+from .models import Payment
+
+class PaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Payment
+        fields = ['id', 'user', 'property', 'method', 'amount', 'status', 'transaction_id', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+class SubscriptionPaymentSerializer(serializers.Serializer):
+    """For handling subscription payment requests."""
+    plan = serializers.ChoiceField(choices=['monthly', 'annual'])
+    phone = serializers.CharField(max_length=20)  # For M-Pesa number
+
+# --- File: ./payments/tests.py ---
+from django.test import TestCase
+from django.contrib.auth.models import User
+from property.models import Property, AgentProfile
+from payments.models import Payment
+from django.urls import reverse
+
+class PaymentStatusTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='test', password='pass')
+        self.listing_owner = User.objects.create_user(username='owner', password='pass')
+        self.listing = Property.objects.create(owner=self.listing_owner, title='L', description='d', type='House', price=100, city='c', area=100)
+        self.payment = Payment.objects.create(user=self.user, property=self.listing, method='mpesa', amount=100)
+
+    def test_payment_status_requires_auth(self):
+        url = reverse('payment_status', args=[self.payment.id])
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 302)  # redirects to login
+
+    def test_payment_status_authenticated(self):
+        self.client.login(username='test', password='pass')
+        url = reverse('payment_status', args=[self.payment.id])
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('status', resp.json())
+from django.test import TestCase
+
+# Create your tests here.
+
+
+# --- File: ./payments/admin.py ---
+from django.contrib import admin
+
+from django.contrib import admin
+from .models import Payment
+
+@admin.register(Payment)
+class PaymentAdmin(admin.ModelAdmin):
+	list_display = ('id', 'user', 'property', 'method', 'amount', 'status', 'created_at')
+	search_fields = ('user__username', 'property__title', 'transaction_id')
+	list_filter = ('method', 'status', 'created_at')
+
+	actions = ['mark_reviewed', 'flag_payment']
+
+	def mark_reviewed(self, request, queryset):
+		queryset.update(status='reviewed')
+		self.message_user(request, "Selected payments marked as reviewed.")
+	mark_reviewed.short_description = "Mark selected payments as reviewed"
+
+	def flag_payment(self, request, queryset):
+		queryset.update(status='flagged')
+		self.message_user(request, "Selected payments flagged.")
+	flag_payment.short_description = "Flag selected payments"
+
+
+# --- File: ./payments/api.py ---
+from rest_framework import viewsets, permissions, status
+from rest_framework.response import Response
+from .models import Payment
+from django.db.models import Q
+from rest_framework.decorators import action
+from .serializers import PaymentSerializer, SubscriptionPaymentSerializer
+import json
+from django.http import HttpResponse
+from django.template.loader import render_to_string
+from weasyprint import HTML
+from datetime import datetime
+from django.contrib.auth import get_user_model
+from django.core.exceptions import PermissionDenied
+
+User = get_user_model()
+
+class PaymentViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = PaymentSerializer
+
+    def get_queryset(self):
+        """Filter payments based on user role."""
+        user = self.request.user
+        if user.is_superuser:
+            return Payment.objects.all().order_by('-created_at')
+        elif user.groups.filter(name='agent').exists():
+            # Agents see payments related to their properties
+            return Payment.objects.filter(
+                Q(user=user) |  # Their own payments
+                Q(property__owner=user)  # Payments for properties they own
+            ).order_by('-created_at')
+        else:
+            # Regular users see only their own payments
+            return Payment.objects.filter(user=user).order_by('-created_at')
+
+    def list(self, request):
+        """Return paginated list of payments with related data."""
+        payments = self.get_queryset()
+        data = [{
+            'id': payment.id,
+            'user': {
+                'id': payment.user.id,
+                'username': payment.user.username,
+                'email': payment.user.email,
+            },
+            'property': {
+                'id': payment.property.id,
+                'title': payment.property.title,
+            } if payment.property else None,
+            'method': payment.method,
+            'amount': str(payment.amount),
+            'status': payment.status,
+            'transaction_id': payment.transaction_id,
+            'created_at': payment.created_at.isoformat(),
+        } for payment in payments]
+        return Response(data)
+
+    @action(detail=False, methods=['get'])
+    def subscription(self, request):
+        """Get subscription plans and pricing."""
+        # TODO: Move to settings/config when ready for production
+        plans = {
+            'monthly': {
+                'id': 'monthly',
+                'name': 'Monthly Plan',
+                'price': 50000,
+                'description': 'Perfect for getting started',
+                'features': [
+                    'Unlimited property listings',
+                    'Priority customer support',
+                    'Advanced analytics',
+                    'Featured listing priority'
+                ],
+                'duration': 30  # days
+            },
+            'annual': {
+                'id': 'annual',
+                'name': 'Annual Plan',
+                'price': 500000,
+                'description': 'Best value for serious agents',
+                'features': [
+                    'Everything in Monthly plan',
+                    '2 months free',
+                    'Featured listings priority',
+                    'Dedicated account manager'
+                ],
+                'duration': 365  # days
+            }
+        }
+        return Response(plans)
+
+    @action(detail=False, methods=['get'])
+    def admin_list(self, request):
+        """Get all payments for admin panel with extended details."""
+        if not request.user.is_superuser:
+            raise PermissionDenied("Only administrators can access this endpoint")
+        
+        payments = Payment.objects.all().order_by('-created_at')
+        data = [{
+            'id': payment.id,
+            'transactionId': payment.transaction_id,
+            'amount': float(payment.amount),
+            'status': payment.status,
+            'type': payment.method,
+            'user': f"{payment.user.first_name} {payment.user.last_name}" if payment.user.first_name else payment.user.username,
+            'date': payment.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+            'property': payment.property.title if payment.property else None,
+        } for payment in payments]
+        return Response(data)
+
+    @action(detail=True, methods=['post'])
+    def retry(self, request, pk=None):
+        """Retry a failed payment."""
+        if not request.user.is_superuser:
+            raise PermissionDenied("Only administrators can retry payments")
+
+        payment = self.get_object()
+        if payment.status != 'failed':
+            return Response(
+                {"error": "Only failed payments can be retried"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Implement retry logic based on payment method
+        if payment.method == 'mpesa':
+            # TODO: Implement M-Pesa retry logic
+            pass
+        elif payment.method == 'stripe':
+            # TODO: Implement Stripe retry logic
+            pass
+
+        # For now, just mark as pending to simulate retry
+        payment.status = 'pending'
+        payment.save()
+        
+        return Response({"status": "Payment retry initiated"})
+
+    @action(detail=True, methods=['get'])
+    def receipt(self, request, pk=None):
+        """Generate and download a payment receipt."""
+        if not request.user.is_superuser:
+            raise PermissionDenied("Only administrators can download receipts")
+
+        payment = self.get_object()
+        if payment.status != 'completed':
+            return Response(
+                {"error": "Receipts are only available for completed payments"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Generate receipt HTML
+        context = {
+            'payment': payment,
+            'date': payment.created_at.strftime('%Y-%m-%d'),
+            'receipt_no': f"RCP-{payment.id}",
+            'company_name': 'SmartDalali',
+            'company_email': 'support@smartdalali.com',
+        }
+        
+        html_string = render_to_string('payments/receipt_template.html', context)
+        
+        # Convert to PDF
+        pdf_file = HTML(string=html_string).write_pdf()
+        
+        # Prepare response
+        response = HttpResponse(pdf_file, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="receipt-{payment.id}.pdf"'
+        
+        return response
+
+# --- File: ./payments/views.py ---
+from django.shortcuts import get_object_or_404
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+import json
+from django.conf import settings
+from property.models import Property, AgentProfile
+from .models import Payment
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import permission_classes
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def stk_push(request, property_id):
+	property = get_object_or_404(Property, id=property_id)
+	phone = request.data.get('phone')
+	amount = request.data.get('amount')
+	callback_url = request.build_absolute_uri('/api/payments/mpesa/callback/')
+
+	# Import Mpesa client lazily to avoid import-time errors when django_daraja is not installed
+	try:
+		from django_daraja.mpesa.core import MpesaClient
+	except Exception as e:
+		return Response({'error': 'Mpesa client not available', 'details': str(e)}, status=501)
+
+	try:
+		mpesa_client = MpesaClient(settings.DAR_AFFILIATE_CONSUMER_KEY, settings.DAR_AFFILIATE_CONSUMER_SECRET)
+		response = mpesa_client.stk_push(
+			amount=amount,
+			phone_number=phone,
+			account_reference=f"Property-{property.id}",
+			transaction_desc=f"Pay for property {property.id}",
+			callback_url=callback_url,
+			business_shortcode=settings.DAR_SHORTCODE,
+			passkey=settings.DAR_PASSKEY
+		)
+	except Exception as e:
+		return Response({'error': 'Failed to send STK push', 'details': str(e)}, status=502)
+
+	Payment.objects.create(
+		user=request.user,
+		property=property,
+		method='mpesa',
+		amount=amount,
+		status='pending',
+		raw_payload=response
+	)
+	return Response(response)
+
+@csrf_exempt
+def mpesa_callback(request):
+	payload = json.loads(request.body.decode('utf-8'))
+	# TODO: verify payload structure per Daraja docs
+	# Find payment and update status
+	transaction_id = payload.get('Body', {}).get('stkCallback', {}).get('CheckoutRequestID')
+	result_code = payload.get('Body', {}).get('stkCallback', {}).get('ResultCode')
+	payment = Payment.objects.filter(transaction_id=transaction_id).first()
+	if payment:
+		payment.status = 'success' if result_code == 0 else 'failed'
+		payment.raw_payload = payload
+		payment.save()
+		# If successful, activate agent subscription
+		if result_code == 0 and payment.property:
+			agent_profile = AgentProfile.objects.filter(user=payment.property.owner).first()
+			if agent_profile:
+				agent_profile.subscription_active = True
+				# Set expiry to 1 month from now (or extend if already active)
+				from django.utils import timezone
+				import datetime
+				now = timezone.now()
+				if agent_profile.subscription_expires and agent_profile.subscription_expires > now:
+					agent_profile.subscription_expires += datetime.timedelta(days=30)
+				else:
+					agent_profile.subscription_expires = now + datetime.timedelta(days=30)
+				agent_profile.save()
+	return JsonResponse({'status': 'received'})
+
+# Create your views here.
+
+
+from rest_framework.decorators import api_view
+from django.contrib.auth.decorators import login_required
+
+
+@api_view(['GET'])
+@login_required
+def payment_status(request, payment_id):
+	"""Return payment status so frontend can poll for completion."""
+	payment = get_object_or_404(Payment, id=payment_id)
+	data = {
+		'id': payment.id,
+		'status': payment.status,
+		'transaction_id': payment.transaction_id,
+		'amount': str(payment.amount),
+		'method': payment.method,
+		'property_id': payment.property.id if payment.property else None,
+		'raw_payload': payment.raw_payload,
+	}
+	return Response(data)
+
+
+# --- File: ./payments/urls.py ---
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import stk_push, mpesa_callback, payment_status
+from .api import PaymentViewSet
+
+router = DefaultRouter()
+router.register(r'payments', PaymentViewSet, basename='payment')
+
+urlpatterns = [
+    path('mpesa/stk/<int:property_id>/', stk_push, name='stk_push'),
+    path('mpesa/callback/', mpesa_callback, name='mpesa_callback'),
+    path('status/<int:payment_id>/', payment_status, name='payment_status'),
+    path('', include(router.urls)),
+]
+
+
+# --- File: ./payments/apps.py ---
+from django.apps import AppConfig
+
+
+class PaymentsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'payments'
+
+
+# --- File: ./payments/models.py ---
+from django.db import models
+from django.conf import settings
+from property.models import Property
+
+class Payment(models.Model):
+	PAYMENT_METHODS = (
+		('mpesa', 'M-Pesa'),
+		('stripe', 'Stripe'),
+	)
+	user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+	# The DB currently has a `listing_id` column (legacy). Map the model field to that
+	# column so the admin and ORM don't fail while we create a proper migration to
+	# reconcile listings vs property relation.
+	property = models.ForeignKey(
+		Property,
+		on_delete=models.CASCADE,
+		# Use default db column name (property_id). The DB column was renamed to
+		# `property_id` manually, so don't override `db_column` here.
+		null=True,
+		blank=True,
+	)
+	method = models.CharField(max_length=20, choices=PAYMENT_METHODS)
+	amount = models.DecimalField(max_digits=12, decimal_places=2)
+	transaction_id = models.CharField(max_length=128, blank=True)
+	status = models.CharField(max_length=32, default='pending')
+	raw_payload = models.JSONField(blank=True, null=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	def __str__(self):
+		return f"{self.method} {self.amount} {self.status}"
+
+
+# --- File: ./user_management/serializers.py ---
+from rest_framework import serializers
+from django.contrib.auth.models import User
+from accounts.models import Profile
+from property.models import AgentProfile
+
+class UserSerializer(serializers.ModelSerializer):
+    profile = serializers.SerializerMethodField()
+    agent_profile = serializers.SerializerMethodField()
+    role = serializers.SerializerMethodField()
+    groups = serializers.StringRelatedField(many=True, read_only=True)
+    
+    class Meta:
+        model = User
+        fields = [
+            'id', 'username', 'email', 'first_name', 'last_name',
+            'is_active', 'is_staff', 'is_superuser', 'date_joined',
+            'last_login', 'profile', 'agent_profile', 'role', 'groups'
+        ]
+        read_only_fields = ['id', 'date_joined', 'last_login']
+    
+    def get_profile(self, obj):
+        try:
+            profile = obj.profile
+            return {
+                'name': profile.name,
+                'phone_number': profile.phone_number,
+                'address': profile.address,
+                'image': profile.image.url if profile.image else None,
+                'code': profile.code,
+                'created_at': profile.created_at
+            }
+        except:
+            return None
+    
+    def get_agent_profile(self, obj):
+        try:
+            agent_profile = obj.agentprofile
+            return {
+                'agency_name': agent_profile.agency_name,
+                'phone': agent_profile.phone,
+                'verified': agent_profile.verified,
+                'subscription_active': agent_profile.subscription_active,
+                'subscription_expires': agent_profile.subscription_expires
+            }
+        except:
+            return None
+    
+    def get_role(self, obj):
+        if obj.is_superuser:
+            return 'admin'
+        elif obj.groups.filter(name='agent').exists():
+            return 'agent'
+        else:
+            return 'user'
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    user = serializers.StringRelatedField(read_only=True)
+    
+    class Meta:
+        model = Profile
+        fields = [
+            'id', 'user', 'password,' 'name', 'phone_number', 'address', 'image', 'code', 'created_at'
+        ]
+        read_only_fields = ['id', 'user', 'code', 'created_at', 'password']
+
+class AgentProfileSerializer(serializers.ModelSerializer):
+    user = serializers.StringRelatedField(read_only=True)
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_username = serializers.CharField(source='user.username', read_only=True)
+    first_name = serializers.CharField(source='user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.last_name', read_only=True)
+    property_count = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = AgentProfile
+        fields = [
+            'id', 'user', 'user_email', 'user_username', 'agency_name', 'phone',
+            'verified', 'subscription_active', 'subscription_expires',
+            'first_name', 'last_name', 'property_count'
+        ]
+        read_only_fields = ['id', 'user', 'user_email', 'user_username', 'first_name', 'last_name']
+    
+    def get_property_count(self, obj):
+        from property.models import Property
+        return Property.objects.filter(owner=obj.user).count()
+
+
+
+# --- File: ./user_management/views.py ---
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from django.contrib.auth.models import User, Group
+from django.db.models import Q, Count
+from django.utils import timezone
+from datetime import timedelta
+from accounts.models import Profile
+from property.models import AgentProfile
+from .serializers import UserSerializer, UserProfileSerializer, AgentProfileSerializer
+
+class UserManagementViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = UserSerializer
+    permission_classes = [IsAdminUser]
+    
+    def get_queryset(self):
+        queryset = User.objects.all().select_related('profile')
+        
+        # Filter by role
+        role = self.request.query_params.get('role')
+        if role == 'agent':
+            queryset = queryset.filter(groups__name='agent')
+        elif role == 'user':
+            queryset = queryset.exclude(groups__name='agent').exclude(is_superuser=True)
+        elif role == 'admin':
+            queryset = queryset.filter(is_superuser=True)
+        
+        # Search by username or email
+        search = self.request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(
+                Q(username__icontains=search) |
+                Q(email__icontains=search) |
+                Q(first_name__icontains=search) |
+                Q(last_name__icontains=search)
+            )
+        
+        return queryset.order_by('-date_joined')
+    
+    @action(detail=True, methods=['post'])
+    def toggle_agent_status(self, request, pk=None):
+        """Toggle agent status for a user"""
+        user = self.get_object()
+        agent_group = Group.objects.get(name='agent')
+        
+        if user.groups.filter(name='agent').exists():
+            user.groups.remove(agent_group)
+            # Deactivate agent profile if exists
+            try:
+                agent_profile = user.agentprofile
+                agent_profile.subscription_active = False
+                agent_profile.save()
+            except:
+                pass
+            message = f"{user.username} is no longer an agent"
+        else:
+            user.groups.add(agent_group)
+            # Create agent profile if doesn't exist
+            AgentProfile.objects.get_or_create(user=user)
+            message = f"{user.username} is now an agent"
+        
+        return Response({'message': message})
+    
+    @action(detail=True, methods=['post'])
+    def toggle_active_status(self, request, pk=None):
+        """Toggle active status for a user"""
+        user = self.get_object()
+        user.is_active = not user.is_active
+        user.save()
+        
+        status_text = "activated" if user.is_active else "deactivated"
+        return Response({'message': f"{user.username} has been {status_text}"})
+    
+    @action(detail=False, methods=['get'])
+    def stats(self, request):
+        """Get user statistics"""
+        stats = {
+            'total_users': User.objects.count(),
+            'active_users': User.objects.filter(is_active=True).count(),
+            'agents': User.objects.filter(groups__name='agent').count(),
+            'admins': User.objects.filter(is_superuser=True).count(),
+            'users_with_profiles': User.objects.filter(profile__isnull=False).count(),
+            'recent_signups': User.objects.filter(
+                date_joined__gte=timezone.now() - timedelta(days=30)
+            ).count(),
+        }
+        
+        # Monthly signup stats
+        from django.utils import timezone
+        from datetime import timedelta
+        monthly_stats = []
+        for i in range(6):
+            month_start = timezone.now() - timedelta(days=30*i)
+            month_end = month_start + timedelta(days=30)
+            count = User.objects.filter(
+                date_joined__gte=month_start,
+                date_joined__lt=month_end
+            ).count()
+            monthly_stats.append({
+                'month': month_start.strftime('%b'),
+                'count': count
+            })
+        
+        stats['monthly_signups'] = monthly_stats
+        
+        return Response(stats)
+
+class UserProfileViewSet(viewsets.ModelViewSet):
+    serializer_class = UserProfileSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        if self.request.user.is_superuser:
+            return Profile.objects.all()
+        else:
+            return Profile.objects.filter(user=self.request.user)
+    
+    def get_object(self):
+        if self.request.user.is_superuser:
+            return super().get_object()
+        else:
+            return self.request.user.profile
+    
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+    
+    def perform_update(self, serializer):
+        serializer.save()
+
+class AgentProfileViewSet(viewsets.ModelViewSet):
+    serializer_class = AgentProfileSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        if self.request.user.is_superuser:
+            return AgentProfile.objects.all()
+        else:
+            return AgentProfile.objects.filter(user=self.request.user)
+    
+    def get_object(self):
+        if self.request.user.is_superuser:
+            return super().get_object()
+        else:
+            return self.request.user.agentprofile
+    
+    @action(detail=True, methods=['post'])
+    def verify_agent(self, request, pk=None):
+        """Verify an agent (admin only)"""
+        if not request.user.is_superuser:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        agent_profile = self.get_object()
+        agent_profile.verified = True
+        agent_profile.save()
+        
+        return Response({'message': f"Agent {agent_profile.user.username} has been verified"})
+    
+    @action(detail=True, methods=['post'])
+    def activate_subscription(self, request, pk=None):
+        """Activate agent subscription (admin only)"""
+        if not request.user.is_superuser:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        agent_profile = self.get_object()
+        agent_profile.subscription_active = True
+        agent_profile.subscription_expires = timezone.now() + timedelta(days=30)
+        agent_profile.save()
+        
+        return Response({'message': f"Subscription activated for {agent_profile.user.username}"})
+
+
+# --- File: ./user_management/urls.py ---
+from rest_framework.routers import DefaultRouter
+from .views import UserManagementViewSet, UserProfileViewSet, AgentProfileViewSet
+
+router = DefaultRouter()
+router.register(r'users', UserManagementViewSet, basename='user-management')
+router.register(r'profiles', UserProfileViewSet, basename='user-profile')
+router.register(r'agent-profiles', AgentProfileViewSet, basename='agent-profile')
+
+urlpatterns = router.urls
+
+
+
+# --- File: ./user_management/apps.py ---
+from django.apps import AppConfig
+
+
+class UserManagementConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'user_management'
+
+
+
+# --- File: ./api_auth/tests.py ---
+from django.test import TestCase
+from django.contrib.auth.models import User
+from django.urls import reverse
+
+class ProfileSubscriptionTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='u', password='p')
+
+    def test_profile_subscription_in_response(self):
+        self.client.login(username='u', password='p')
+        url = reverse('user_profile')
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn('subscription', data)
+
+
+# --- File: ./api_auth/__init__.py ---
+"""api_auth package initialization.
+
+This package provides JWT helpers and DRF authentication for the API.
+The Django app config is declared in :mod:`api_auth.apps.ApiAuthConfig`.
+"""
+
+
+# --- File: ./api_auth/views.py ---
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.models import User
+from django.http import JsonResponse
+from accounts.models import Profile
+import json
+from rest_framework.decorators import authentication_classes
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def auth_login(request):
+    """Login endpoint"""
+    try:
+        data = json.loads(request.body)
+        # Accept either username or email from frontend
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+
+        if not password or (not username and not email):
+            return Response({'error': 'Username/email and password required'}, status=400)
+
+        user = None
+        # If username provided, try authenticating directly
+        if username:
+            user = authenticate(request, username=username, password=password)
+        else:
+            # Try to resolve email to username
+            user_obj = User.objects.filter(email=email).first()
+            if user_obj and user_obj.check_password(password):
+                # Credentials OK — set user to the found user
+                user = user_obj
+        if user is not None:
+            if user.is_active:
+                login(request, user)
+                return Response({'message': 'Login successful'})
+            else:
+                return Response({'error': 'Account is not active'}, status=400)
+        else:
+            return Response({'error': 'Invalid credentials'}, status=401)
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def auth_logout(request):
+    """Logout endpoint"""
+    try:
+        logout(request)
+        return Response({'message': 'Logout successful'})
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def auth_register(request):
+    """Register new user"""
+    try:
+        data = json.loads(request.body)
+        username = data.get('username')
+        email = data.get('email')
+        password1 = data.get('password1')
+        password2 = data.get('password2')
+        
+        if not all([username, email, password1, password2]):
+            return Response({'error': 'All fields required'}, status=400)
+        
+        if password1 != password2:
+            return Response({'error': 'Passwords do not match'}, status=400)
+        
+        if User.objects.filter(username=username).exists():
+            return Response({'error': 'Username already exists'}, status=400)
+        
+        if User.objects.filter(email=email).exists():
+            return Response({'error': 'Email already exists'}, status=400)
+        
+        user = User.objects.create_user(
+            username=username,
+            email=email,
+            password=password1,
+            is_active=False  # Require activation
+        )
+        
+        # Create profile
+        Profile.objects.create(user=user)
+        
+        return Response({'message': 'User created successfully. Please activate your account.'})
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def user_profile(request):
+    """Get user profile"""
+    try:
+        user = request.user
+        profile = getattr(user, 'profile', None)
+        
+        # Determine user role
+        role = 'user'
+        if user.is_superuser:
+            role = 'superuser'
+        elif user.groups.filter(name='agent').exists():
+            role = 'agent'
+        
+        profile_data = {}
+        if profile:
+            profile_data = {
+                'name': profile.name,
+                'phone_number': profile.phone_number,
+                'address': profile.address,
+                'image': profile.image.url if profile.image else None
+            }
+        # Include agent subscription info if available
+        subscription_info = {
+            'is_agent': user.groups.filter(name='agent').exists(),
+            'subscription_active': False,
+            'subscription_expires': None,
+        }
+        if subscription_info['is_agent']:
+            from property.models import AgentProfile
+            agent_profile = AgentProfile.objects.filter(user=user).first()
+            if agent_profile:
+                subscription_info['subscription_active'] = bool(agent_profile.subscription_active)
+                subscription_info['subscription_expires'] = agent_profile.subscription_expires
+        
+        return Response({
+            'id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'role': role,
+            'isAuthenticated': True,
+            'is_superuser': user.is_superuser,
+            'groups': list(user.groups.values_list('name', flat=True)),
+            'profile': profile_data,
+            'subscription': subscription_info,
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def update_user_profile(request):
+    """Update user profile"""
+    try:
+        user = request.user
+        profile = getattr(user, 'profile', None)
+        
+        if not profile:
+            return Response({'error': 'Profile not found'}, status=404)
+        
+        data = json.loads(request.body)
+        
+        # Update profile fields
+        if 'name' in data:
+            profile.name = data['name']
+        if 'phone_number' in data:
+            profile.phone_number = data['phone_number']
+        if 'address' in data:
+            profile.address = data['address']
+        
+        profile.save()
+        
+        return Response({'message': 'Profile updated successfully'})
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+
+
+
+from django.contrib.admin.views.decorators import staff_member_required
+from django.views.decorators.http import require_http_methods
+
+
+@staff_member_required
+@require_http_methods(['GET', 'POST'])
+def chatbot_toggle(request):
+    """Admin-only view to get or set chatbot availability.
+
+    GET -> returns JSON { enabled: bool }
+    POST -> JSON body { enabled: true|false } to toggle
+    """
+    from django.conf import settings
+    from settings.models import SiteSettings
+    if request.method == 'GET':
+        ss = SiteSettings.objects.filter(key='ENABLE_LLM_CHATBOT').first()
+        enabled = ss.value.lower() == 'true' if ss and ss.value else False
+        return JsonResponse({'enabled': enabled})
+
+    # POST: persist setting in DB
+    try:
+        import json
+        data = json.loads(request.body)
+        enabled = bool(data.get('enabled', False))
+        ss, _ = SiteSettings.objects.get_or_create(key='ENABLE_LLM_CHATBOT')
+        ss.value = 'true' if enabled else 'false'
+        ss.save()
+        return JsonResponse({'enabled': enabled})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+
+# --- File: ./api_auth/urls.py ---
+from django.urls import path
+from . import views
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView,
+)
+
+urlpatterns = [
+    path('token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('login/', views.auth_login, name='auth_login'),
+    path('logout/', views.auth_logout, name='auth_logout'),
+    path('register/', views.auth_register, name='auth_register'),
+    path('me/', views.user_profile, name='me'),
+    path('profile/', views.user_profile, name='user_profile'),
+    path('profile/update/', views.update_user_profile, name='update_user_profile'),
+]
+
+
+# --- File: ./api_auth/authentication.py ---
+from rest_framework.authentication import BaseAuthentication
+from rest_framework import exceptions
+from django.contrib.auth.models import User
+
+
+class JWTAuthentication(BaseAuthentication):
+    """JWT authentication using HS256 and SECRET_KEY.
+
+    Supports Authorization: Bearer <token> with payload containing:
+    { 'user_id': <id>, 'type': 'access', 'exp': <ts>, 'iat': <ts> }
+    """
+
+    keyword = 'bearer'
+
+    def authenticate(self, request):
+        auth_header = request.META.get('HTTP_AUTHORIZATION')
+        if not auth_header:
+            return None
+
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != self.keyword:
+            return None
+
+        token = parts[1]
+        # payload = decode_token(token) # This was the custom decode_token
+        # if not payload:
+        #     raise exceptions.AuthenticationFailed('Invalid or expired token')
+
+        # token_type = payload.get('type')
+        # if token_type != 'access':
+        #     raise exceptions.AuthenticationFailed('Invalid token type')
+
+        # user_id = payload.get('user_id')
+        # if not isinstance(user_id, int):
+        #     raise exceptions.AuthenticationFailed('Invalid token payload')
+
+        # try:
+        #     user = User.objects.get(pk=user_id)
+        # except User.DoesNotExist:
+        #     raise exceptions.AuthenticationFailed('User not found')
+
+        # if not user.is_active:
+        #     raise exceptions.AuthenticationFailed('User inactive')
+
+        # return (user, None)
+        raise exceptions.AuthenticationFailed('Custom JWT authentication is disabled. Use simplejwt.')
+
+
+# --- File: ./api_auth/apps.py ---
+from django.apps import AppConfig
+
+
+class ApiAuthConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'api_auth'
+
+
+# --- File: ./accounts/tests.py ---
+from django.test import TestCase
+
+# Create your tests here.
+
+
+# --- File: ./accounts/forms.py ---
+from django import forms
+from django.contrib.auth.forms import UserCreationForm
+from django.contrib.auth.models import User
+from .models import Profile
+
+class SignupForm(UserCreationForm):
+    # Fields from the User model
+    email = forms.EmailField(required=True)
+    
+    # Fields from the Profile model
+    phone = forms.CharField(max_length=15, required=False)
+    image = forms.ImageField(required=False)
+    name = forms.CharField(max_length=50, required=False)
+    about = forms.CharField(widget=forms.Textarea, required=False)
+    address = forms.CharField(max_length=100, required=False)
+    # Let users indicate they are registering as an agent
+    is_agent = forms.BooleanField(required=False, initial=False, label='Register as an agent')
+
+    class Meta:
+        model = User
+        fields = ['username', 'email', 'password1', 'password2', 'phone', 'image', 'name', 'about', 'address', 'is_agent']
+
+    def save(self, commit=True):
+        # First, save the User part of the form
+        user = super(SignupForm, self).save(commit=False)
+        user.email = self.cleaned_data['email']
+
+        # Keep user inactive until email activation
+        user.save()
+
+        # Then create or update the Profile model
+        Profile.objects.create(
+            user=user,
+            phone_number = self.cleaned_data['phone'],
+            image = self.cleaned_data['image'],
+            name = self.cleaned_data['name'],
+            about = self.cleaned_data['about'],
+            address = self.cleaned_data['address'],
+        )
+        return user
+    
+
+class ActivationForm(forms.Form):
+    code = forms.CharField(max_length=8)
+
+
+# --- File: ./accounts/admin.py ---
+from django.contrib import admin
+from django.contrib.auth.models import User, Group
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from .models import Profile
+from property.models import AgentProfile
+
+class AgentProfileInline(admin.StackedInline):
+    model = AgentProfile
+    can_delete = False
+    verbose_name_plural = 'Agent Profile'
+    fk_name = 'user'
+
+class ProfileAdmin(admin.ModelAdmin):
+    list_display = ['user', 'phone_number', 'name', 'address']
+    search_fields = ['user__username', 'phone_number', 'name']
+
+class UserAdmin(BaseUserAdmin):
+    inlines = [AgentProfileInline]
+    list_display = ('username', 'email', 'is_staff', 'is_superuser', 'is_active')
+    list_filter = ('is_staff', 'is_superuser', 'is_active', 'groups')
+    search_fields = ('username', 'email')
+
+admin.site.unregister(User)
+admin.site.register(User, UserAdmin)
+admin.site.register(Profile, ProfileAdmin)
+
+
+# --- File: ./accounts/views.py ---
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth.models import User, Group
+from django.contrib.auth.decorators import login_required
+from django.core.mail import send_mail
+from django.conf import settings
+from django.http import JsonResponse
+from django.db.models import Avg
+
+from property.models import Property
+from .forms import SignupForm, ActivationForm
+from .models import Profile
+from langchain_community.llms import Ollama
+
+
+def signup(request):
+    """Register a new user. Creates an inactive user and sends activation code via email."""
+    if request.method == 'POST':
+        form = SignupForm(request.POST, request.FILES)
+        if form.is_valid():
+            username = form.cleaned_data['username']
+            email = form.cleaned_data['email']
+
+            user = form.save(commit=False)
+            user.is_active = False
+            user.save()  # The signal should create the Profile here
+
+            # If the registrant asked to be an agent, add them to the agent group
+            try:
+                if form.cleaned_data.get('is_agent'):
+                    agent_group, _ = Group.objects.get_or_create(name='agent')
+                    user.groups.add(agent_group)
+            except Exception:
+                # Non-fatal: don't block signup if group logic fails
+                pass
+
+            profile = user.profile
+
+            # Send an activation email
+            send_mail(
+                "Activate Your Account",
+                f"Welcome {username}\nUse this code {profile.code} to activate your account.",
+                settings.EMAIL_HOST_USER,
+                [email],
+                fail_silently=False,
+            )
+            return redirect(f'/accounts/{username}/activate')
+
+    else:
+        form = SignupForm()
+    return render(request, 'registration/register.html', {'form': form})
+
+
+def activate(request, username):
+    """Activate a user when they submit the activation code."""
+    user = get_object_or_404(User, username=username)
+    profile = user.profile
+
+    if request.method == 'POST':
+        form = ActivationForm(request.POST)
+        if form.is_valid():
+            code = form.cleaned_data['code']
+            if code == profile.code:
+                profile.code = ''
+                profile.save()
+
+                user.is_active = True
+                user.save()
+
+                return redirect('/accounts/login')
+    else:
+        form = ActivationForm()
+
+    return render(request, 'registration/activate.html', {'form': form})
+
+
+@login_required
+def Profile(request):
+    """Render the logged-in user's profile and their properties."""
+    user_pk = request.user.pk
+    profile = User.objects.get(pk=user_pk)
+    properties = Property.objects.filter(owner=user_pk)
+    return render(request, 'account/profile.html',
+                  {'profile': profile, 'propertys': properties, 'request': request})
+
+
+from django.views.decorators.csrf import csrf_protect
+from django.contrib.auth.decorators import login_required
+
+@login_required
+@csrf_protect
+def generate_ollama3_text(request):
+    """Chatbot endpoint: analyze a short query and return generated text from Ollama LLM.
+    Only enabled if settings.ENABLE_LLM_CHATBOT is True.
+    """
+    from django.conf import settings
+    if not getattr(settings, 'ENABLE_LLM_CHATBOT', False):
+        return JsonResponse({'error': 'Chatbot is disabled.'}, status=503)
+
+    if request.method == 'POST':
+        input_text = request.POST.get('input_text', '').lower()
+        extracted_data = {}
+
+        # Target models to inspect
+        target_models = {
+            'user': User,
+            'property': Property,
+        }
+
+        for model_name, model in target_models.items():
+            if model_name in input_text:
+                try:
+                    count = model.objects.count()
+                    extracted_data[model_name] = f'Total {model_name} records: {count}'
+
+                    if model == User:
+                        usernames = ', '.join([u.username for u in model.objects.all()[:3]])
+                        extracted_data[f'{model_name}_list'] = f'Recent users: {usernames}'
+
+                    elif model == Property:
+                        active_properties = model.objects.filter(status='active').count()
+                        latest_titles = ', '.join([p.title for p in model.objects.order_by('-created_at')[:3]])
+
+                        extracted_data['active_properties'] = f'Active properties: {active_properties}'
+                        extracted_data['latest_properties'] = f'Latest properties: {latest_titles}'
+
+                except Exception as e:
+                    extracted_data[model_name] = f'Error fetching {model_name} data: {str(e)}'
+
+        # General property queries
+        if 'property' in input_text or 'real estate' in input_text:
+            try:
+                avg_price = Property.objects.all().aggregate(Avg('price'))['price__avg']
+                if avg_price is not None:
+                    extracted_data['avg_price'] = f'Average property price: {avg_price:.2f}'
+            except Exception as e:
+                extracted_data['price_error'] = f'Could not calculate prices: {str(e)}'
+
+        data_str = '\n'.join([f"- {k}: {v}" for k, v in extracted_data.items()]) or "No relevant data found"
+
+        prompt = f"""
+        Question: {input_text}
+
+        Available data:
+        {data_str}
+
+        Instructions:
+        1. Answer in English unless asked otherwise.
+        2. Use numbers and specific details where appropriate.
+        3. Mention the data source when relevant.
+        4. Keep answers concise but informative.
+        """
+
+        try:
+            llm = Ollama(model="llama3.2")
+            response = llm.invoke(prompt)
+            return JsonResponse({'generated_text': response})
+        except Exception as e:
+            return JsonResponse({'error': f"Error generating response: {str(e)}"}, status=500)
+
+    return render(request, 'account/chatbot.html')
+
+
+from django.contrib.admin.views.decorators import staff_member_required
+from django.views.decorators.http import require_http_methods
+
+
+@staff_member_required
+@require_http_methods(['GET', 'POST'])
+def chatbot_toggle(request):
+    """Admin-only view to get or set chatbot availability.
+
+    GET -> returns JSON { enabled: bool }
+    POST -> JSON body { enabled: true|false } to toggle
+    """
+    from django.conf import settings
+    from settings.models import SiteSettings
+    if request.method == 'GET':
+        ss = SiteSettings.objects.filter(key='ENABLE_LLM_CHATBOT').first()
+        enabled = ss.value.lower() == 'true' if ss and ss.value else False
+        return JsonResponse({'enabled': enabled})
+
+    # POST: persist setting in DB
+    try:
+        import json
+        data = json.loads(request.body)
+        enabled = bool(data.get('enabled', False))
+        ss, _ = SiteSettings.objects.get_or_create(key='ENABLE_LLM_CHATBOT')
+        ss.value = 'true' if enabled else 'false'
+        ss.save()
+        return JsonResponse({'enabled': enabled})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+# --- File: ./accounts/signals.py ---
+from django.contrib.auth.models import Group
+from django.db.models.signals import post_migrate, m2m_changed
+from django.dispatch import receiver
+from django.conf import settings
+from property.models import AgentProfile
+from .models import Profile
+
+@receiver(m2m_changed, sender=settings.AUTH_USER_MODEL.groups.through)
+def create_agent_profile_on_group_add(sender, instance, action, pk_set, **kwargs):
+    if action == "post_add":
+        agent_group = Group.objects.filter(name="agent").first()
+        if not agent_group:
+            return
+        if agent_group.pk in pk_set:
+            # Ensure Profile exists
+            profile, _ = Profile.objects.get_or_create(user=instance)
+            AgentProfile.objects.get_or_create(user=instance, profile=profile)
+
+@receiver(post_migrate)
+def create_default_groups(sender, **kwargs):
+    """Create default groups if they don't exist.
+
+    This runs after migrations. We keep it idempotent and simple: always
+    ensure the groups exist. Avoid depending on sender name because
+    post_migrate may be emitted for many apps.
+    """
+    Group.objects.get_or_create(name='owner')  # Project owner
+    Group.objects.get_or_create(name='agent')  # middleman
+    Group.objects.get_or_create(name='buyer')  # Normal user
+
+
+
+# --- File: ./accounts/urls.py ---
+from django.urls import path
+from django.contrib.auth import views as auth_views
+
+from . import views
+
+app_name = 'accounts'
+
+urlpatterns = [
+    path('profile/', views.Profile, name='profile_user'),
+    path('signup/', views.signup, name='signup'),
+    path('logout/', auth_views.LogoutView.as_view(), name='logout'),
+    path('gpt', views.generate_ollama3_text),
+
+    path('<str:username>/activate', views.activate),
+
+]
+
+# --- File: ./accounts/apps.py ---
+from django.apps import AppConfig
+
+
+class AccountsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'accounts'
+
+    def ready(self):
+        # Import signal handlers to ensure they are registered when the app is ready
+        try:
+            import accounts.signals  # noqa: F401
+        except Exception:
+            # Avoid failing app startup if signals module has issues
+            pass
+
+
+# --- File: ./accounts/models.py ---
+from django.db import models
+from django.contrib.auth.models import User
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from utils.generate_code import generate_code
+
+class Profile(models.Model):
+    user = models.OneToOneField(User, related_name='profile', on_delete=models.CASCADE)
+    name = models.CharField(max_length=50, blank=True, null=True)
+    about = models.CharField(max_length=1000, blank=True, null=True)
+    phone_number = models.CharField(max_length=15, blank=True, null=True)
+    address = models.CharField(max_length=100, blank=True, null=True)
+    image = models.ImageField(upload_to='profile_images/', blank=True, null=True)
+    code = models.CharField(max_length=8, default=generate_code)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.user.username
+
+# Create or update Profile when User is created or saved
+# @receiver(post_save, sender=User)
+# def create_or_update_profile(sender, instance, created, **kwargs):
+#     if created:
+#         Profile.objects.create(user=instance)
+#     # If the User is updated, ensure the Profile is also saved
+#     instance.profile.save()
+
+# post_save.connect(create_or_update_profile, sender=User)
+
+
+# --- File: ./messaging/consumers.py ---
+import json
+from channels.generic.websocket import AsyncWebsocketConsumer
+from channels.db import database_sync_to_async
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
+
+class NotificationConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        user = self.scope["user"]
+        
+        if user.is_anonymous:
+            await self.close()
+            return
+
+        # Add user to their personal notification group
+        self.group_name = f"notifications_{user.id}"
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        await self.accept()
+
+    async def disconnect(self, close_code):
+        # Remove user from their notification group
+        if hasattr(self, 'group_name'):
+            await self.channel_layer.group_discard(
+                self.group_name,
+                self.channel_name
+            )
+
+    async def notification_message(self, event):
+        """Send notification to WebSocket"""
+        message = event["message"]
+        await self.send(text_data=json.dumps(message))
+
+# --- File: ./messaging/serializers.py ---
+from rest_framework import serializers
+from .models import Conversation, Message, MessageNotification, Notification
+from accounts.models import Profile
+
+class MessageSerializer(serializers.ModelSerializer):
+    sender_name = serializers.CharField(source='sender.username', read_only=True)
+    sender_role = serializers.SerializerMethodField()
+    sender_avatar = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Message
+        fields = ['id', 'sender', 'sender_name', 'sender_role', 'sender_avatar', 'content', 'is_read', 'created_at']
+        read_only_fields = ['sender', 'is_read', 'created_at']
+    
+    def get_sender_role(self, obj):
+        if obj.sender.is_superuser:
+            return 'admin'
+        elif obj.sender.groups.filter(name='agent').exists():
+            return 'agent'
+        else:
+            return 'user'
+    
+    def get_sender_avatar(self, obj):
+        try:
+            profile = obj.sender.profile
+            if profile and profile.image:
+                return profile.image.url
+        except:
+            pass
+        return None
+
+class ConversationSerializer(serializers.ModelSerializer):
+    other_participant = serializers.SerializerMethodField()
+    last_message = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+    property_title = serializers.CharField(source='property.title', read_only=True)
+    
+    class Meta:
+        model = Conversation
+        fields = [
+            'id', 'participants', 'other_participant', 'property', 'property_title',
+            'last_message', 'unread_count', 'created_at', 'updated_at', 'is_active'
+        ]
+        read_only_fields = ['participants', 'created_at', 'updated_at']
+    
+    def get_other_participant(self, obj):
+        request = self.context.get('request')
+        if request and request.user:
+            other_user = obj.get_other_participant(request.user)
+            if other_user:
+                return {
+                    'id': other_user.id,
+                    'username': other_user.username,
+                    'email': other_user.email,
+                    'role': 'admin' if other_user.is_superuser else ('agent' if other_user.groups.filter(name='agent').exists() else 'user'),
+                    'avatar': other_user.profile.image.url if hasattr(other_user, 'profile') and other_user.profile.image else None
+                }
+        return None
+    
+    def get_last_message(self, obj):
+        last_msg = obj.get_last_message()
+        if last_msg:
+            return {
+                'id': last_msg.id,
+                'content': last_msg.content,
+                'sender_id': last_msg.sender.id,
+                'sender_name': last_msg.sender.username,
+                'created_at': last_msg.created_at,
+                'is_read': last_msg.is_read
+            }
+        return None
+    
+    def get_unread_count(self, obj):
+        request = self.context.get('request')
+        if request and request.user:
+            return obj.messages.filter(sender__in=obj.participants.exclude(id=request.user.id), is_read=False).count()
+        return 0
+
+class CreateMessageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Message
+        fields = ['content']
+    
+    def create(self, validated_data):
+        conversation = self.context['conversation']
+        sender = self.context['request'].user
+        
+        message = Message.objects.create(
+            conversation=conversation,
+            sender=sender,
+            content=validated_data['content']
+        )
+        
+        # Create notifications for other participants
+        for participant in conversation.participants.exclude(id=sender.id):
+            MessageNotification.objects.create(
+                user=participant,
+                message=message
+            )
+        
+        # Update conversation timestamp
+        conversation.save()
+        
+        return message
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ['id', 'type', 'title', 'message', 'read', 'created_at', 'data']
+        read_only_fields = ['created_at']
+
+
+# --- File: ./messaging/admin.py ---
+from django.contrib import admin
+from .models import Conversation, Message, MessageNotification
+
+@admin.register(Conversation)
+class ConversationAdmin(admin.ModelAdmin):
+    list_display = ['id', 'get_participants', 'property', 'is_active', 'created_at', 'updated_at']
+    list_filter = ['is_active', 'created_at']
+    search_fields = ['participants__username', 'property__title']
+    filter_horizontal = ['participants']
+    
+    def get_participants(self, obj):
+        return ', '.join([p.username for p in obj.participants.all()])
+    get_participants.short_description = 'Participants'
+
+@admin.register(Message)
+class MessageAdmin(admin.ModelAdmin):
+    list_display = ['id', 'conversation', 'sender', 'content_preview', 'is_read', 'created_at']
+    list_filter = ['is_read', 'created_at']
+    search_fields = ['sender__username', 'content', 'conversation__participants__username']
+    readonly_fields = ['created_at']
+    
+    def content_preview(self, obj):
+        return obj.content[:50] + '...' if len(obj.content) > 50 else obj.content
+    content_preview.short_description = 'Content Preview'
+
+@admin.register(MessageNotification)
+class MessageNotificationAdmin(admin.ModelAdmin):
+    list_display = ['id', 'user', 'message', 'is_read', 'created_at']
+    list_filter = ['is_read', 'created_at']
+    search_fields = ['user__username', 'message__content']
+    readonly_fields = ['created_at']
+
+
+
+# --- File: ./messaging/views.py ---
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Q
+from .models import Conversation, Message, MessageNotification, Notification
+from .serializers import ConversationSerializer, MessageSerializer, CreateMessageSerializer, NotificationSerializer
+
+class ConversationViewSet(viewsets.ModelViewSet):
+    serializer_class = ConversationSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        return Conversation.objects.filter(participants=user, is_active=True)
+    
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+    
+    @action(detail=True, methods=['get'])
+    def messages(self, request, pk=None):
+        conversation = self.get_object()
+        messages = conversation.messages.all()
+        serializer = MessageSerializer(messages, many=True)
+        
+        # Mark messages as read for the current user
+        conversation.messages.filter(
+            sender__in=conversation.participants.exclude(id=request.user.id),
+            is_read=False
+        ).update(is_read=True)
+        
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def send_message(self, request, pk=None):
+        conversation = self.get_object()
+        serializer = CreateMessageSerializer(
+            data=request.data,
+            context={'conversation': conversation, 'request': request}
+        )
+        
+        if serializer.is_valid():
+            message = serializer.save()
+            return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=False, methods=['post'])
+    def start_conversation(self, request):
+        """Start a new conversation with another user"""
+        user_id = request.data.get('user_id')
+        property_id = request.data.get('property_id')
+        
+        if not user_id:
+            return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if user exists and is not the current user
+        from django.contrib.auth.models import User
+        try:
+            other_user = User.objects.get(id=user_id)
+            if other_user == request.user:
+                return Response({'error': 'Cannot start conversation with yourself'}, status=status.HTTP_400_BAD_REQUEST)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if conversation already exists
+        existing_conversation = Conversation.objects.filter(
+            participants=request.user
+        ).filter(
+            participants=other_user
+        ).first()
+        
+        if existing_conversation:
+            return Response(ConversationSerializer(existing_conversation, context={'request': request}).data)
+        
+        # Create new conversation
+        conversation = Conversation.objects.create()
+        conversation.participants.add(request.user, other_user)
+        
+        # Add property if specified
+        if property_id:
+            from property.models import Property
+            try:
+                property_obj = Property.objects.get(id=property_id)
+                conversation.property = property_obj
+                conversation.save()
+            except Property.DoesNotExist:
+                pass
+        
+        return Response(ConversationSerializer(conversation, context={'request': request}).data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['get'])
+    def unread_count(self, request):
+        """Get total unread message count for the user"""
+        user = request.user
+        unread_count = MessageNotification.objects.filter(user=user, is_read=False).count()
+        return Response({'unread_count': unread_count})
+
+class MessageViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = MessageSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        return Message.objects.filter(conversation__participants=user)
+    
+    @action(detail=True, methods=['post'])
+    def mark_read(self, request, pk=None):
+        """Mark a message as read"""
+        message = self.get_object()
+        
+        # Check if user is a participant in the conversation
+        if request.user not in message.conversation.participants.all():
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        
+        message.mark_as_read()
+        
+        # Mark notification as read
+        MessageNotification.objects.filter(
+            user=request.user,
+            message=message
+        ).update(is_read=True)
+        
+        return Response({'message': 'Message marked as read'})
+
+
+class NotificationViewSet(viewsets.ModelViewSet):
+    serializer_class = NotificationSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        return Notification.objects.filter(user=self.request.user).order_by('-created_at')
+    
+    @action(detail=True, methods=['post'])
+    def read(self, request, pk=None):
+        """Mark a notification as read"""
+        notification = self.get_object()
+        notification.read = True
+        notification.save()
+        return Response({'status': 'notification marked as read'})
+    
+    @action(detail=False, methods=['post'])
+    def mark_all_read(self, request):
+        """Mark all notifications as read"""
+        self.get_queryset().update(read=True)
+        return Response({'status': 'all notifications marked as read'})
+
+
+# --- File: ./messaging/urls.py ---
+from rest_framework.routers import DefaultRouter
+from .views import ConversationViewSet, MessageViewSet, NotificationViewSet
+
+router = DefaultRouter()
+router.register(r'conversations', ConversationViewSet, basename='conversation')
+router.register(r'messages', MessageViewSet, basename='message')
+router.register(r'notifications', NotificationViewSet, basename='notification')
+
+urlpatterns = router.urls
+
+
+# --- File: ./messaging/apps.py ---
+from django.apps import AppConfig
+
+
+class MessagingConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'messaging'
+
+
+
+# --- File: ./messaging/models.py ---
+from django.db import models
+from django.conf import settings
+from django.utils import timezone
+
+class Conversation(models.Model):
+    participants = models.ManyToManyField(settings.AUTH_USER_MODEL, related_name='conversations')
+    property = models.ForeignKey('property.Property', on_delete=models.CASCADE, null=True, blank=True, related_name='conversations')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        ordering = ['-updated_at']
+    
+    def __str__(self):
+        participant_names = [p.username for p in self.participants.all()]
+        return f"Conversation between {', '.join(participant_names)}"
+    
+    def get_other_participant(self, user):
+        """Get the other participant in the conversation"""
+        return self.participants.exclude(id=user.id).first()
+    
+    def get_last_message(self):
+        """Get the last message in the conversation"""
+        return self.messages.order_by('-created_at').first()
+
+class Message(models.Model):
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
+    sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='sent_messages')
+    content = models.TextField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['created_at']
+    
+    def __str__(self):
+        return f"Message from {self.sender.username} in {self.conversation}"
+    
+    def mark_as_read(self):
+        """Mark the message as read"""
+        self.is_read = True
+        self.save()
+
+class MessageNotification(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='message_notifications')
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name='notifications')
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ['user', 'message']
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"Notification for {self.user.username} about message from {self.message.sender.username}"
+
+class Notification(models.Model):
+    NOTIFICATION_TYPES = (
+        ('message', 'Message'),
+        ('support', 'Support'),
+        ('property', 'Property'),
+        ('system', 'System'),
+    )
+    
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    type = models.CharField(max_length=20, choices=NOTIFICATION_TYPES)
+    title = models.CharField(max_length=255)
+    message = models.TextField()
+    read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    data = models.JSONField(null=True, blank=True)  # For additional data
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.type} - {self.title} for {self.user}"
+
+
+# --- File: ./messaging/routing.py ---
+from django.urls import re_path
+from . import consumers
+
+websocket_urlpatterns = [
+    # Use named capture group for any user parameters
+    re_path(r'ws/notifications/$', consumers.NotificationConsumer.as_asgi()),
+]
+
+# --- File: ./messaging/serializers/notification.py ---
+from rest_framework import serializers
+from ..models import Notification
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ['id', 'type', 'title', 'message', 'read', 'created_at', 'data']
+        read_only_fields = ['created_at']
+
+# --- File: ./hitcount/admin.py ---
+from django.contrib import admin
+from hitcount.models import Hit, HitCount, BlacklistedIP, BlacklistedUserAgent
+
+@admin.register(Hit)
+class HitAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user_agent', 'ip', 'created')
+    search_fields = ('ip', 'user_agent')
+    list_filter = ('created',)
+
+@admin.register(HitCount)
+class HitCountAdmin(admin.ModelAdmin):
+    list_display = ('id', 'content_type', 'object_pk', 'hits')
+    search_fields = ('object_pk',)
+    list_filter = ('content_type',)
+
+@admin.register(BlacklistedIP)
+class BlacklistedIPAdmin(admin.ModelAdmin):
+    list_display = ('ip',)
+    search_fields = ('ip',)
+    actions = ['remove_blacklist']
+    def remove_blacklist(self, request, queryset):
+        queryset.delete()
+        self.message_user(request, "Selected IPs removed from blacklist.")
+    remove_blacklist.short_description = "Remove selected IPs from blacklist"
+
+@admin.register(BlacklistedUserAgent)
+class BlacklistedUserAgentAdmin(admin.ModelAdmin):
+    list_display = ('user_agent',)
+    search_fields = ('user_agent',)
+    actions = ['remove_blacklist']
+    def remove_blacklist(self, request, queryset):
+        queryset.delete()
+        self.message_user(request, "Selected user agents removed from blacklist.")
+    remove_blacklist.short_description = "Remove selected user agents from blacklist"
+
+
+# --- File: ./settings/serializers.py ---
+from rest_framework import serializers
+from .models import Company, Phone, SocialMediaLinks, SiteSettings
+
+class CompanySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Company
+        fields = '__all__'
+
+class PhoneSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Phone
+        fields = '__all__'
+
+class SocialMediaLinksSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SocialMediaLinks
+        fields = '__all__'
+
+class SiteSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SiteSettings
+        fields = '__all__'
+
+# --- File: ./settings/tests.py ---
+from django.test import TestCase
+
+# Create your tests here.
+
+
+# --- File: ./settings/admin.py ---
+from django.contrib import admin
+from .models import Company, Phone, SocialMediaLinks, SiteSettings
+
+
+
+
+class PhoneTabularInline(admin.TabularInline):
+    model = Phone
+   
+class SocialMediaLinksTabular(admin.TabularInline):
+    model = SocialMediaLinks
+
+
+
+
+
+class CompanyAdmin(admin.ModelAdmin):
+    list_display = ('title', 'email', 'location', 'created_at')
+    list_filter = ('title', 'created_at')
+    search_fields = ('title', 'about', 'email', 'location')
+    inlines = [PhoneTabularInline, SocialMediaLinksTabular]
+
+admin.site.register(Company, CompanyAdmin)
+admin.site.register(SiteSettings)
+
+
+# --- File: ./settings/api.py ---
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from django.core.cache import cache
+from django.conf import settings
+from .models import Company, Phone, SocialMediaLinks, SiteSettings
+from .serializers import (
+    CompanySerializer,
+    PhoneSerializer,
+    SocialMediaLinksSerializer,
+    SiteSettingsSerializer
+)
+
+class CompanySettingsViewSet(viewsets.ModelViewSet):
+    queryset = Company.objects.all()
+    serializer_class = CompanySerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def get_object(self):
+        """Always return the latest company settings."""
+        return Company.objects.last()
+
+    def create(self, request, *args, **kwargs):
+        """Update or create company settings."""
+        instance = self.get_object()
+        if instance:
+            serializer = self.get_serializer(instance, data=request.data)
+        else:
+            serializer = self.get_serializer(data=request.data)
+        
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        cache.delete('company_settings')  # Clear cache
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+class PhoneViewSet(viewsets.ModelViewSet):
+    queryset = Phone.objects.all()
+    serializer_class = PhoneSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+class SocialMediaLinksViewSet(viewsets.ModelViewSet):
+    queryset = SocialMediaLinks.objects.all()
+    serializer_class = SocialMediaLinksSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+class SiteSettingsViewSet(viewsets.ModelViewSet):
+    queryset = SiteSettings.objects.all()
+    serializer_class = SiteSettingsSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    @action(detail=False, methods=['post'])
+    def bulk_update(self, request):
+        """Update multiple settings at once."""
+        settings_data = request.data
+        updated = []
+        
+        for key, value in settings_data.items():
+            setting, created = SiteSettings.objects.update_or_create(
+                key=key,
+                defaults={'value': value}
+            )
+            updated.append({'key': key, 'value': value})
+            cache.delete(f'setting_{key}')  # Clear individual setting cache
+            
+        return Response(updated, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'])
+    def all_settings(self, request):
+        """Get all settings as a key-value dictionary."""
+        settings = SiteSettings.objects.all()
+        settings_dict = {setting.key: setting.value for setting in settings}
+        return Response(settings_dict)
+
+# --- File: ./settings/views.py ---
+from django.shortcuts import render
+from .models import Company, Phone, SocialMediaLinks
+from property import models
+from django.core.cache import cache
+# Create your views here.
+
+def home(request):
+    propertys = models.Property.objects.order_by("-created_at")[:6]
+    session_data = request.session.items()  # عرض جميع بيانات الجلسة
+    # requ  est.session.flush()  # يحذف جميع بيانات الجلسة
+
+    print(session_data)
+
+    # cache.set('propertys', propertys, 60 * 15)  # Cache for 15 minutes
+    return render(request, 'settings/index.html', {'propertys':propertys})
+
+def about(request):
+    data = Company.objects.last()
+    return render(request, 'settings/about.html', {'data':data})
+
+def contact(request):
+    data = Company.objects.last()
+    phone = Phone.objects.all()
+    social_media = SocialMediaLinks.objects.all()
+    return render(request, 'settings/contact.html', {'data':data})    
+    
+
+# --- File: ./settings/urls.py ---
+from django.urls import path, include
+from django.views.decorators.csrf import ensure_csrf_cookie
+from django.http import JsonResponse
+from .views import home, about, contact
+
+urlpatterns = [
+    path('', home, name='home'),
+    path('about/', about, name='about'),
+    path('contact/', contact, name='contact'),
+    path('csrf-token/', ensure_csrf_cookie(lambda request: JsonResponse({'detail': 'csrf set'})), name='csrf_token'),
+    path('properties/', include('property.urls')),
+]
+
+
+# --- File: ./settings/apps.py ---
+from django.apps import AppConfig
+
+
+class SettingsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'settings'
+
+
+# --- File: ./settings/models.py ---
+from django.db import models
+from django.utils import timezone
+from django.contrib import admin
+
+# Create your models here.
+
+class Company(models.Model):
+    title = models.CharField(max_length=20)
+    logo = models.ImageField(upload_to='logo')
+    about = models.TextField(max_length=300)
+    email = models.EmailField()
+    location = models.CharField(max_length=20)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    def __str__(self):
+        return self.title
+
+
+class Phone(models.Model):
+    phone = models.CharField(max_length=20)
+    company = models.ForeignKey(Company, on_delete=models.SET_NULL, null=True, blank=True)
+
+    def __str__(self):
+        return self.phone
+
+
+class SocialMediaLinks(models.Model):
+    account_name = models.CharField(max_length=20)
+    account_link = models.CharField(max_length=200)
+    company = models.ForeignKey(Company, on_delete=models.SET_NULL, null=True, blank=True)
+
+    def __str__(self):
+        return self.account_name
+
+
+class SiteSettings(models.Model):
+    """Simple key settings stored in DB. Use this for runtime toggles like chatbot enable."""
+    key = models.CharField(max_length=100, unique=True)
+    value = models.CharField(max_length=200, blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.key}={self.value}"
+
+# --- File: ./settings/context_processor/company_data.py ---
+from settings.models import Company, SocialMediaLinks, Phone
+
+
+
+def company_data(request):
+    data = Company.objects.last()
+    social_media = SocialMediaLinks.objects.all()
+    phone = Phone.objects.all()
+    return {'company_data': data, 'social_media': social_media, 'phone': phone}
+
+
+# --- File: ./property/serializers.py ---
+from rest_framework import serializers
+from .models import Property, ImagesProperty, FloorPlansImages, Features
+
+
+
+class ImagesPropertySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ImagesProperty
+        fields = ['id', 'Image']
+
+
+class FloorPlansImagesSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FloorPlansImages
+        fields = ['id', 'Image']
+
+
+class FeaturesSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Features
+        fields = ['id', 'features']
+
+
+class SerializerProperty(serializers.ModelSerializer):
+    ImagesProperty = ImagesPropertySerializer(many=True, required=False)
+    ImageFloorProperty = FloorPlansImagesSerializer(many=True, required=False)
+    Features_Property = FeaturesSerializer(many=True, required=False)
+    agent = serializers.SerializerMethodField()
+    main_image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Property
+        fields = [
+            'id', 'title', 'description', 'price', 'status', 'sku', 'type',
+            'bathroom', 'bedroom', 'area', 'area_m2', 'parking', 'year_built',
+            'city', 'address', 'location', 'lat', 'lng', 'image', 'video',
+            'is_published', 'is_paid', 'featured_until', 'view_count',
+            'owner', 'created_at', 'updated_at', 'ImagesProperty',
+            'ImageFloorProperty', 'Features_Property', 'agent', 'main_image_url'
+        ]
+        read_only_fields = ['owner', 'created_at', 'updated_at', 'view_count']
+
+    def get_agent(self, obj):
+        try:
+            user = obj.owner
+            profile = getattr(user, 'profile', None)
+            return {
+                'id': user.id,
+                'username': getattr(user, 'username', None),
+                'name': getattr(profile, 'name', None) if profile else None,
+                'phone': getattr(profile, 'phone_number', None) if profile else None,
+            }
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error getting agent details: {str(e)}", exc_info=True)
+            return {
+                'id': None,
+                'username': None,
+                'name': None,
+                'phone': None
+            }
+
+    def get_main_image_url(self, obj):
+        try:
+            if obj.image and hasattr(obj.image, 'url'):
+                return obj.image.url
+            # fallback to first gallery image
+            first = obj.ImagesProperty.first()
+            if first and hasattr(first, 'Image') and getattr(first, 'Image'):
+                return first.Image.url
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error getting main image URL for property {obj.id}: {str(e)}", exc_info=True)
+            return None
+        return None
+
+    def create(self, validated_data, owner=None):
+        images_data = validated_data.pop('ImagesProperty', [])
+        floor_data = validated_data.pop('ImageFloorProperty', [])
+        features_data = validated_data.pop('Features_Property', [])
+
+        # Create the Property instance
+        # If an owner kwarg was provided (from view.save), attach it
+        if owner is not None:
+            validated_data['owner'] = owner
+        property_instance = Property.objects.create(**validated_data)
+
+        # If request context has uploaded files, prefer those
+        request = self.context.get('request') if hasattr(self, 'context') else None
+        if request is not None:
+            # Files from multipart form
+            files_images = request.FILES.getlist('ImagesProperty')
+            for f in files_images:
+                ImagesProperty.objects.create(property=property_instance, Image=f)
+
+            files_floor = request.FILES.getlist('ImageFloorProperty')
+            for f in files_floor:
+                FloorPlansImages.objects.create(property=property_instance, Image=f)
+
+            # Features can be provided as repeated form fields
+            if hasattr(request.POST, 'getlist'):
+                feats = request.POST.getlist('Features_Property')
+                for feat in feats:
+                    Features.objects.create(property=property_instance, features=feat)
+
+                # If a main image was uploaded under the 'image' field, assign it.
+                main_image = request.FILES.get('image')
+                if main_image:
+                    property_instance.image = main_image
+                    property_instance.save()
+
+                # If main image field on Property wasn't provided but there are uploaded gallery images,
+                # set the main image to the first uploaded gallery image.
+                if not property_instance.image and files_images:
+                    property_instance.image = files_images[0]
+                    property_instance.save()
+
+        # Also handle nested validated data if provided as JSON
+        for img in images_data:
+            ImagesProperty.objects.create(property=property_instance, Image=img.get('Image'))
+
+        for fl in floor_data:
+            FloorPlansImages.objects.create(property=property_instance, Image=fl.get('Image'))
+
+        for feat in features_data:
+            Features.objects.create(property=property_instance, features=feat.get('features'))
+
+        return property_instance
+
+# --- File: ./property/tests.py ---
+from django.test import TestCase
+
+# Create your tests here.
+
+
+# --- File: ./property/forms.py ---
+from django import forms
+from .models import Property, ImagesProperty, FloorPlansImages, Features
+
+class PropertyForm(forms.ModelForm):
+    class Meta:
+        model = Property
+        fields = '__all__'
+        widgets = {
+            'description': forms.Textarea(attrs={'rows': 3}),
+            'year_built': forms.DateInput(attrs={'type': 'date'}),
+        }
+    
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['location'].widget.attrs.update({'id': 'id_location', 'class': 'form-control'})
+    
+    
+    # def __init__(self, *args, **kwargs):
+    #     super().__init__(*args, **kwargs)
+    #     # You can add customizations here if needed
+    #     self.fields['owner'].queryset = User.objects.all()  # Example customization
+
+class ImagePropertyForm(forms.ModelForm):
+    class Meta:
+        model = ImagesProperty
+        fields = ['Image']
+
+class FloorPlanForm(forms.ModelForm):
+    class Meta:
+        model = FloorPlansImages
+        fields = ['Image']
+
+class FeatureForm(forms.ModelForm):
+    class Meta:
+        model = Features
+        fields = ['features']
+
+# --- File: ./property/admin.py ---
+from django.contrib import admin
+from .models import AgentProfile, Property, ImagesProperty, FloorPlansImages
+
+@admin.register(AgentProfile)
+class AgentProfileAdmin(admin.ModelAdmin):
+    list_display = ('user', 'agency_name', 'phone', 'verified', 'subscription_active', 'subscription_expires')
+    search_fields = ('user__username', 'agency_name', 'phone')
+
+    actions = ['activate_subscription', 'deactivate_subscription']
+
+
+    def activate_subscription(self, request, queryset):
+        from django.utils import timezone
+        import datetime
+        for agent in queryset:
+            agent.subscription_active = True
+            agent.subscription_expires = timezone.now() + datetime.timedelta(days=30)
+            agent.save()
+        self.message_user(request, "Selected agents' subscriptions activated for 1 month.")
+    activate_subscription.short_description = "Activate subscription for 1 month"
+
+
+    def deactivate_subscription(self, request, queryset):
+        for agent in queryset:
+            agent.subscription_active = False
+            agent.subscription_expires = None
+            agent.save()
+        self.message_user(request, "Selected agents' subscriptions deactivated.")
+    deactivate_subscription.short_description = "Deactivate subscription"
+
+
+class ImagesPropertyTabularInline(admin.TabularInline):
+    model = ImagesProperty
+
+class FloorPlansImagesTabularInline(admin.TabularInline):
+    model = FloorPlansImages
+    
+#class FeaturesTabularInline(admin.TabularInline):
+   #model = Features
+
+@admin.register(Property)
+class PropertyInline(admin.ModelAdmin):
+    list_display = ('title','price', 'location', 'created_at')
+    list_filter = ('city', 'created_at')
+    search_fields = ('title', 'description', 'city', 'location')
+    inlines = [ImagesPropertyTabularInline, FloorPlansImagesTabularInline]
+
+
+
+
+# --- File: ./property/permissions.py ---
+from rest_framework import permissions
+
+
+class IsAgentSubscribed(permissions.BasePermission):
+    """Allow create only if agent has active subscription."""
+    def has_permission(self, request, view):
+        if request.method != 'POST':
+            return True
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if not user.groups.filter(name='agent').exists():
+            return False
+        from .models import AgentProfile
+        profile = AgentProfile.objects.filter(user=user).first()
+        return profile and profile.subscription_active
+
+
+# --- File: ./property/api.py ---
+from rest_framework import viewsets
+from rest_framework.permissions import IsAuthenticatedOrReadOnly
+from .serializers import SerializerProperty
+from .permissions import IsAgentSubscribed
+from .models import Property
+
+class PropertyViewSet(viewsets.ModelViewSet):
+    """API-compatible viewset so `property` can replace `listings` endpoints."""
+    serializer_class = SerializerProperty
+    permission_classes = [IsAgentSubscribed, IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated and user.groups.filter(name='agent').exists():
+            return Property.objects.filter(owner=user)
+        return Property.objects.filter(is_published=True)
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
+
+# --- File: ./property/views.py ---
+from django.shortcuts import render, redirect
+from django.views.generic import ListView, DetailView, CreateView
+from django.forms import modelformset_factory
+from django.urls import reverse_lazy
+
+from .forms import PropertyForm, ImagePropertyForm, FloorPlanForm, FeatureForm
+from .models import Property, ImagesProperty, FloorPlansImages, Features
+
+
+class PropertyList(ListView):
+    model = Property
+    template_name = 'property_list.html'
+    context_object_name = 'properties'
+
+class createProperty(CreateView):
+    model = Property
+    fields = '__all__'   
+    template_name = 'create_property.html'
+    success_url = "/"  # Redirect to property list page after successful creation
+
+def CreatePropertyView(request):
+    ImageFormSet = modelformset_factory(ImagesProperty, form=ImagePropertyForm, extra=4, can_delete=True)
+    FloorPlanFormSet = modelformset_factory(FloorPlansImages, form=FloorPlanForm, extra=2, can_delete=True)
+    FeatureFormSet = modelformset_factory(Features, form=FeatureForm, extra=3, can_delete=True)
+
+    if request.method == 'POST':
+        property_form = PropertyForm(request.POST, request.FILES)
+        image_formset = ImageFormSet(request.POST, request.FILES, queryset=ImagesProperty.objects.none(), prefix='images')
+        floorplan_formset = FloorPlanFormSet(request.POST, request.FILES, queryset=FloorPlansImages.objects.none(), prefix='floorplans')
+        feature_formset = FeatureFormSet(request.POST, queryset=Features.objects.none(), prefix='features')
+
+        if property_form.is_valid() and image_formset.is_valid() and floorplan_formset.is_valid() and feature_formset.is_valid():
+            # Save main property
+            property_instance = property_form.save(commit=False)
+            property_instance.owner = request.user  # Set logged in user
+            property_instance.save()
+
+            # Save images
+            for form in image_formset.cleaned_data:
+                if form and not form.get('DELETE'):
+                    image = form.get('Image')
+                    if image:
+                        ImagesProperty.objects.create(
+                            property=property_instance,
+                            Image=image
+                        )
+
+            # Save floor plans
+            for form in floorplan_formset.cleaned_data:
+                if form and not form.get('DELETE'):
+                    image = form.get('Image')
+                    if image:
+                        FloorPlansImages.objects.create(
+                            property=property_instance,
+                            Image=image
+                        )
+
+            # Save features
+            for form in feature_formset.cleaned_data:
+                if form and not form.get('DELETE'):
+                    feature = form.get('features')
+                    if feature:
+                        Features.objects.create(
+                            property=property_instance,
+                            features=feature
+                        )
+
+            return redirect('/')  # Replace with your success URL
+
+    else:
+        property_form = PropertyForm()
+        image_formset = ImageFormSet(queryset=ImagesProperty.objects.none(), prefix='images')
+        floorplan_formset = FloorPlanFormSet(queryset=FloorPlansImages.objects.none(), prefix='floorplans')
+        feature_formset = FeatureFormSet(queryset=Features.objects.none(), prefix='features')
+
+    context = {
+        'property_form': property_form,
+        'image_formset': image_formset,
+        'floorplan_formset': floorplan_formset,
+        'feature_formset': feature_formset,
+    }
+
+    return render(request, 'create_property.html', context)
+
+class PropertyDetail(DetailView):
+    model = Property
+    template_name = 'property_detail.html'
+    context_object_name = 'property'
+
+    
+    def get_object(self):
+        obj = super().get_object()
+        obj.view_count += 1
+        obj.save()
+        return obj
+
+# --- File: ./property/cache.py ---
+from django.core.cache import cache
+from django.utils.cache import get_cache_key
+from django.conf import settings
+from rest_framework.response import Response
+from functools import wraps
+import logging
+
+logger = logging.getLogger(__name__)
+
+def get_cache_key_for_request(request, prefix='property'):
+    """Generate a cache key based on the full request URL and auth status"""
+    key = f"{prefix}:{request.get_full_path()}"
+    if request.user.is_authenticated:
+        key += f":user_{request.user.id}"
+    return key
+
+def cache_response(view_func):
+    """Decorator to cache DRF view responses"""
+    @wraps(view_func)
+    def wrapped_view(self, request, *args, **kwargs):
+        # Don't cache for authenticated users or non-GET requests
+        if request.user.is_authenticated or request.method != 'GET':
+            return view_func(self, request, *args, **kwargs)
+
+        cache_key = get_cache_key_for_request(request)
+        response_data = cache.get(cache_key)
+
+        if response_data is not None:
+            return Response(response_data)
+
+        response = view_func(self, request, *args, **kwargs)
+        
+        try:
+            # Cache successful responses for 15 minutes
+            if response.status_code == 200:
+                cache.set(cache_key, response.data, timeout=60*15)
+        except Exception as e:
+            logger.error(f"Error caching response: {str(e)}", exc_info=True)
+
+        return response
+    
+    return wrapped_view
+
+# --- File: ./property/urls.py ---
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import PropertyList, PropertyDetail, CreatePropertyView
+from .api import PropertyViewSet
+
+router = DefaultRouter()
+router.register(r'properties', PropertyViewSet, basename='property')
+
+
+
+urlpatterns = [
+    path('list/', PropertyList.as_view(), name='property_list'),
+    path('create/', CreatePropertyView, name='create_property'),
+    path('<int:pk>/', PropertyDetail.as_view(), name='property_detail'),
+    path('', include(router.urls)),
+]
+
+# --- File: ./property/apps.py ---
+from django.apps import AppConfig
+
+
+class PropertyConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'property'
+
+
+# --- File: ./property/throttling.py ---
+from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
+
+class PropertyListThrottle(AnonRateThrottle):
+    rate = '30/minute'
+    scope = 'property_list'
+
+    def allow_request(self, request, view):
+        if request.user.is_authenticated:
+            # Authenticated users get higher limits
+            self.rate = '60/minute'
+        return super().allow_request(request, view)
+
+class PropertySearchThrottle(AnonRateThrottle):
+    rate = '60/minute'
+    scope = 'property_search'
+
+class PropertyDetailThrottle(AnonRateThrottle):
+    rate = '60/minute'
+    scope = 'property_detail'
+
+class PropertyCreateThrottle(UserRateThrottle):
+    rate = '10/hour'
+    scope = 'property_create'
+
+# --- File: ./property/models.py ---
+from django.db import models
+from django.contrib.auth.models import User
+from django.utils import timezone
+import random
+from location_field.models.plain import PlainLocationField
+
+def generate_sku():
+    import random
+    return random.randint(1, 10000)
+
+PROPERTY_TYPES = (
+        ('House', 'House'),
+        ('Apartment', 'Apartment'),
+        ('Office', 'Office'),
+        ('Land', 'Land'),
+        ('Villa', 'Villa'),
+        ('Shop', 'Shop'),
+        ('Warehouse', 'Warehouse'))
+
+STATUS_CHOICES = (
+    ('Rent', 'Rent'),
+    ('Sale', 'Sale'),
+    ('Buy', 'Buy')
+)
+                                    
+class Property(models.Model):
+    # Basic Information
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    price = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(choices=STATUS_CHOICES, max_length=10)
+    sku = models.IntegerField(unique=True, default=generate_sku)
+    
+    # Property Details
+    type = models.CharField(choices=PROPERTY_TYPES, max_length=10)
+    bathroom = models.IntegerField(null=True, blank=True)
+    bedroom = models.IntegerField(null=True, blank=True)
+    area = models.FloatField()
+    area_m2 = models.FloatField(null=True, blank=True)  # Alternative area field
+    parking = models.BooleanField(default=False)
+    year_built = models.DateField(null=True, blank=True)
+    
+    # Location
+    city = models.CharField(max_length=255)
+    address = models.CharField(max_length=300, blank=True)
+    location = PlainLocationField(based_fields=['city'], zoom=9, default='30.0444,31.2357')
+    lat = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    lng = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    
+    # Media
+    image = models.ImageField(upload_to='property')
+    video = models.FileField(upload_to='prop', null=True, blank=True)
+    
+    # Publishing & Business Logic
+    is_published = models.BooleanField(default=False)
+    is_paid = models.BooleanField(default=False)
+    featured_until = models.DateTimeField(null=True, blank=True)
+    
+    # Tracking
+    view_count = models.PositiveIntegerField(default=0)
+    owner = models.ForeignKey(User, related_name='property_owner', on_delete=models.CASCADE)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    def get_lat_lng(self):
+        """Extract latitude and longitude from the location field."""
+        if self.location:
+            lat_lng = self.location.split(',')
+            if len(lat_lng) == 2:
+                return lat_lng[0], lat_lng[1]
+        return '0', '0'  # default values
+
+    def __str__(self) -> str:
+        return self.title
+
+    class Meta:
+        app_label = 'property'
+
+class AgentProfile(models.Model):
+    """Agent profile with subscription management"""
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='property_agentprofile_user')
+    profile = models.OneToOneField('accounts.Profile', on_delete=models.CASCADE, null=True, blank=True, related_name='property_agentprofile_profile')
+    agency_name = models.CharField(max_length=200, blank=True)
+    phone = models.CharField(max_length=32, blank=True)
+    verified = models.BooleanField(default=False)
+    subscription_active = models.BooleanField(default=False)
+    subscription_expires = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        app_label = 'property'
+
+class ImagesProperty(models.Model):
+    Image = models.ImageField(upload_to='property_images')
+    caption = models.CharField(max_length=200, blank=True)
+    property = models.ForeignKey(Property, related_name="ImagesProperty", on_delete=models.SET_NULL, null=True, blank=True)
+
+    class Meta:
+        app_label = 'property'
+
+
+class FloorPlansImages(models.Model):
+    Image = models.ImageField(upload_to='property_images')
+    property = models.ForeignKey(Property,related_name="ImageFloorProperty", on_delete=models.SET_NULL ,null=True, blank=True)    
+
+    class Meta:
+        app_label = 'property'
+
+
+class Features(models.Model):
+    features = models.CharField(max_length=100)
+    property = models.ForeignKey(Property,related_name="Features_Property", on_delete=models.SET_NULL, null=True, blank=True)
+
+    class Meta:
+        app_label = 'property'
+
+
+
+# --- File: ./property/tests_api.py ---
+from django.test import TestCase
+from django.contrib.auth.models import User
+from django.urls import reverse
+from property.models import Property
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.contrib.auth.models import Group
+from property.models import AgentProfile
+
+class PropertyApiTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='propuser', password='pass')
+        # Make the user an agent and give them an active subscription so they can create properties
+        agent_group, _ = Group.objects.get_or_create(name='agent')
+        self.user.groups.add(agent_group)
+        AgentProfile.objects.create(user=self.user, subscription_active=True)
+
+    def test_create_property_with_files(self):
+        self.client.login(username='propuser', password='pass')
+        url = reverse('property:property_create')
+        # Create a small valid PNG image using Pillow
+        try:
+            from PIL import Image
+            from io import BytesIO
+            bio = BytesIO()
+            img = Image.new('RGBA', (10, 10), (255, 0, 0, 255))
+            img.save(bio, format='PNG')
+            bio.seek(0)
+            main_img = SimpleUploadedFile('main.png', bio.read(), content_type='image/png')
+            # create another gallery image
+            bio2 = BytesIO()
+            img2 = Image.new('RGB', (8, 8), (0, 255, 0))
+            img2.save(bio2, format='PNG')
+            bio2.seek(0)
+            gallery_img = SimpleUploadedFile('img.png', bio2.read(), content_type='image/png')
+        except Exception:
+            # Fallback to small bytes if Pillow isn't available; tests may fail
+            png_bytes = (
+                b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
+                b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc`\x00\x00\x00\x02\x00\x01"
+                b"\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82"
+            )
+            main_img = SimpleUploadedFile('main.png', png_bytes, content_type='image/png')
+            gallery_img = SimpleUploadedFile('img.png', png_bytes, content_type='image/png')
+        data = {
+            'title': 'Test', 'price': '100', 'status': 'Sale', 'type': 'House', 'area': '100', 'city': 'C',
+            'description': 'A test property'
+        }
+        # Post multipart with main image + gallery image
+        post_data = data.copy()
+        post_data['image'] = main_img
+        post_data['ImagesProperty'] = gallery_img
+        resp = self.client.post(url, post_data, format='multipart')
+        if resp.status_code not in (200, 201, 302):
+            self.fail(f'Unexpected response {resp.status_code}: {resp.content}')
+
+
+# --- File: ./project/settings.py ---
+"""
+Django settings for project project.
+
+Generated by 'django-admin startproject' using Django 5.1.
+
+For more information on this file, see
+https://docs.djangoproject.com/en/5.1/topics/settings/
+
+For the full list of settings and their values, see
+https://docs.djangoproject.com/en/5.1/ref/settings/
+"""
+
+from pathlib import Path
+from dotenv import load_dotenv
+import os
+# Build paths inside the project like this: BASE_DIR / 'subdir'.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+load_dotenv()  # take environment variables from .env.
+
+
+# Quick-start development settings - unsuitable for production
+# See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
+
+# SECURITY WARNING: keep the secret key used in production secret!
+# Read SECRET_KEY from environment; fallback to a dev key if not provided.
+SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-dhfn74p*yyq0djgdi73&prs88^h903a3a$1s_z4u*-vh@!n+hf')
+
+# DEBUG should be False in production. Control via environment variable.
+DEBUG = os.getenv('DEBUG', 'False').lower() in ('1', 'true', 'yes')
+
+# Hosts allowed to serve the app. In production set this explicitly.
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',') if os.getenv('ALLOWED_HOSTS') else ['*']
+
+# Security-sensitive settings that should be set for production. These default to
+# development-friendly values (False/0) but can be overridden via environment.
+SESSION_COOKIE_SECURE = True  # Always secure when SameSite=None
+CSRF_COOKIE_SECURE = True
+SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False').lower() in ('1', 'true', 'yes')
+SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '0'))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = os.getenv('SECURE_HSTS_INCLUDE_SUBDOMAINS', 'False').lower() in ('1', 'true', 'yes')
+SECURE_HSTS_PRELOAD = os.getenv('SECURE_HSTS_PRELOAD', 'False').lower() in ('1', 'true', 'yes')
+
+# Cookie settings
+SESSION_COOKIE_SAMESITE = 'Lax'  # Changed from None for security
+CSRF_COOKIE_SAMESITE = 'Lax'  # Changed from None for security
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = False  # Allow JavaScript access to CSRF cookie
+CSRF_USE_SESSIONS = False  # Store CSRF token in cookie instead of session
+
+
+# Application definition
+
+INSTALLED_APPS = [
+    'accounts.apps.AccountsConfig',
+    'corsheaders',
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+
+    'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
+
+
+    'location_field.apps.DefaultConfig',
+    'django.contrib.humanize',
+    'hitcount',
+
+    "django_bootstrap5",
+
+    'settings.apps.SettingsConfig',
+    'property.apps.PropertyConfig',
+    'payments.apps.PaymentsConfig',
+    'analytics.apps.AnalyticsConfig',
+    'api_auth.apps.ApiAuthConfig',
+    'support.apps.SupportConfig',
+    'messaging.apps.MessagingConfig',
+    'user_management.apps.UserManagementConfig',
+    
+]
+
+REST_FRAMEWORK = {
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
+    'PAGE_SIZE': 10,
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle'
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/day',
+        'user': '1000/day',
+        'property_list': '30/minute',
+        'property_search': '60/minute',
+        'property_detail': '60/minute',
+        'property_create': '10/hour',
+    },
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ] if not DEBUG else [
+        'rest_framework.renderers.JSONRenderer',
+        'rest_framework.renderers.BrowsableAPIRenderer',
+    ],
+}
+
+# Use session auth and a JWTAuthentication implemented in backend.api_auth.authentication
+REST_FRAMEWORK.setdefault('DEFAULT_AUTHENTICATION_CLASSES', [
+    'rest_framework.authentication.SessionAuthentication',
+    'rest_framework_simplejwt.authentication.JWTAuthentication',
+])
+
+
+
+CSRF_TRUSTED_ORIGINS = [
+    'https://rntij-197-35-101-73.a.free.pinggy.link',
+    # Add other domains as needed
+]
+
+# During development allow local frontend origins to be trusted for CSRF referer checks
+CSRF_TRUSTED_ORIGINS += [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+]
+
+# Development CORS settings - allow local frontend dev servers to access API
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+]
+
+# Allow credentials (cookies) for session-authenticated endpoints
+CORS_ALLOW_CREDENTIALS = True
+
+# Additional CORS settings
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+
+
+LOCATION_FIELD = {
+    'provider.google.api': '//maps.google.com/maps/api/js?sensor=false',
+    'provider.google.api_key': os.getenv('GOOGLE_MAPS_API_KEY'),
+    'provider.google.api_libraries': '',
+    'provider.google.map.type': 'SATELLITE', # Map type: Satellite (Residential)
+    'provider.google.center': {'lat':  -6.369028, 'lng': 34.888822},  #Tanzania Coordinates
+    'provider.google.zoom': 12, # Default zoom level
+}
+
+
+
+
+
+
+MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+ROOT_URLCONF = 'project.urls'
+
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': ['templates'],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+                'settings.context_processor.company_data.company_data',
+
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = 'project.wsgi.application'
+ASGI_APPLICATION = 'project.asgi.application'
+
+
+# Database
+# https://docs.djangoproject.com/en/5.1/ref/settings/#databases
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
+
+# Cache configuration
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'property-cache',
+        'TIMEOUT': 60 * 15,  # 15 minutes default timeout
+        'OPTIONS': {
+            'MAX_ENTRIES': 1000  # Maximum number of items in cache
+        }
+    }
+}
+
+# Password validation
+# https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators
+
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+    },
+]
+
+
+
+
+# JWT optional validation settings
+JWT_ISSUER = 'smartdalali'
+JWT_AUDIENCE = 'smartdalali:web'
+JWT_LEEWAY_SECONDS = 10
+
+# Channels
+ASGI_APPLICATION = 'backend.project.asgi.application'
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',
+    }
+}
+
+# Internationalization
+# https://docs.djangoproject.com/en/5.1/topics/i18n/
+
+LANGUAGE_CODE = 'en-us'
+LANGUAGES = [
+    ('en-us', 'English'),
+    ('sw-tz', 'Swahili'),
+]
+
+TIME_ZONE = 'UTC'
+
+USE_I18N = True
+
+USE_TZ = True
+
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/5.1/howto/static-files/
+
+STATIC_URL = '/static/'
+STATICFILES_DIRS = [ BASE_DIR / "static" ]
+STATIC_ROOT = "static_root"
+MEDIA_URL = '/media/'
+MEDIA_ROOT = "media_root"
+
+
+# Default primary key field type
+# https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+
+# Email Configuration
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD')
+
+# Optional (if you need a default sender)
+DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+
+
+# Redirect to home URL after login (Default redirects to /accounts/profile/)
+# LOGIN_REDIRECT_URL = '/'
+LOGOUT_REDIRECT_URL = '/'
+
+
+
+# --- File: ./project/urls.py ---
+"""
+URL configuration for project project.
+
+The `urlpatterns` list routes URLs to views. For more information please see:
+    https://docs.djangoproject.com/en/5.1/topics/http/urls/
+Examples:
+Function views
+    1. Add an import:  from my_app import views
+    2. Add a URL to urlpatterns:  path('', views.home, name='home')
+Class-based views
+    1. Add an import:  from other_app.views import Home
+    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
+Including another URLconf
+    1. Import the include() function: from django.urls import include, path
+    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
+"""
+from django.contrib import admin
+from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView,
+)
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('accounts/', include([
+        path('', include('django.contrib.auth.urls')),
+        path('', include('accounts.urls', namespace='accounts')),
+    ])),
+    path('', include('settings.urls')),
+    path('property/', include('property.urls')),
+    # API namespaces with versioning
+    path('api/v1/', include([
+        path('property/', include('property.urls')),
+        path('payments/', include('payments.urls')),
+        path('auth/', include('api_auth.urls')),
+        path('analytics/', include('analytics.urls')),
+        path('support/', include('support.urls')),
+        path('messaging/', include('messaging.urls')),
+        path('users/', include('user_management.urls')),
+    ])),
+]
+
+urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+
+# --- File: ./analytics/__init__.py ---
+from django.apps import AppConfig
+
+
+class AnalyticsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'analytics'
+
+
+# --- File: ./analytics/views.py ---
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from django.contrib.auth.models import User
+from django.db.models import Count, Avg, Q, Min, Max
+from property.models import Property
+from accounts.models import Profile
+from datetime import datetime, timedelta
+from django.utils import timezone
+from django.contrib.auth.decorators import login_required
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@login_required
+def analytics_summary(request):
+    """Get analytics summary for admin dashboard"""
+    try:
+        # Basic counts
+        total_properties = Property.objects.count()
+        total_users = User.objects.count()
+        total_agents = User.objects.filter(groups__name='agent').count()
+        
+        # Properties by status
+        properties_by_status = Property.objects.values('status').annotate(count=Count('id'))
+        status_data = {item['status'].lower(): item['count'] for item in properties_by_status}
+        
+        # Properties by type
+        properties_by_type = Property.objects.values('type').annotate(count=Count('id'))
+        type_data = {item['type'].lower(): item['count'] for item in properties_by_type}
+        
+        # Monthly stats (last 6 months)
+        six_months_ago = timezone.now() - timedelta(days=180)
+        monthly_stats = []
+        for i in range(6):
+            month_start = six_months_ago + timedelta(days=30*i)
+            month_end = month_start + timedelta(days=30)
+            
+            month_properties = Property.objects.filter(
+                created_at__gte=month_start,
+                created_at__lt=month_end
+            ).count()
+            
+            # Calculate views for this month (simplified)
+            month_views = Property.objects.filter(
+                created_at__gte=month_start,
+                created_at__lt=month_end
+            ).aggregate(total_views=Count('view_count'))['total_views'] or 0
+            
+            monthly_stats.append({
+                'month': month_start.strftime('%b'),
+                'properties': month_properties,
+                'views': month_views
+            })
+        
+        # Top cities
+        top_cities = Property.objects.values('city').annotate(count=Count('id')).order_by('-count')[:5]
+        cities_data = [{'city': item['city'], 'count': item['count']} for item in top_cities]
+        
+        # Recent activity (simplified)
+        recent_properties = Property.objects.order_by('-created_at')[:5]
+        recent_activity = []
+        for prop in recent_properties:
+            recent_activity.append({
+                'id': prop.id,
+                'type': 'property_created',
+                'description': f"New property '{prop.title}' was created",
+                'timestamp': prop.created_at.isoformat()
+            })
+        
+        return Response({
+            'totalProperties': total_properties,
+            'totalUsers': total_users,
+            'totalAgents': total_agents,
+            'propertiesByStatus': {
+                'sale': status_data.get('sale', 0),
+                'rent': status_data.get('rent', 0),
+                'buy': status_data.get('buy', 0)
+            },
+            'propertiesByType': {
+                'house': type_data.get('house', 0),
+                'apartment': type_data.get('apartment', 0),
+                'office': type_data.get('office', 0),
+                'land': type_data.get('land', 0),
+                'villa': type_data.get('villa', 0),
+                'shop': type_data.get('shop', 0),
+                'warehouse': type_data.get('warehouse', 0)
+            },
+            'monthlyStats': monthly_stats,
+            'topCities': cities_data,
+            'recentActivity': recent_activity
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@login_required
+def agent_analytics(request):
+    """Get agent-specific analytics"""
+    try:
+        user = request.user
+        
+        # Agent's properties
+        agent_properties = Property.objects.filter(owner=user)
+        total_listings = agent_properties.count()
+        total_views = agent_properties.aggregate(total=Count('view_count'))['total'] or 0
+        average_price = agent_properties.aggregate(avg=Avg('price'))['avg'] or 0
+        
+        # Listings by status
+        listings_by_status = agent_properties.values('status').annotate(count=Count('id'))
+        status_data = {item['status'].lower(): item['count'] for item in listings_by_status}
+        
+        # Monthly views (last 6 months)
+        six_months_ago = timezone.now() - timedelta(days=180)
+        monthly_views = []
+        for i in range(6):
+            month_start = six_months_ago + timedelta(days=30*i)
+            month_end = month_start + timedelta(days=30)
+            
+            month_views_count = agent_properties.filter(
+                created_at__gte=month_start,
+                created_at__lt=month_end
+            ).aggregate(total=Count('view_count'))['total'] or 0
+            
+            monthly_views.append({
+                'month': month_start.strftime('%b'),
+                'views': month_views_count
+            })
+        
+        # Top performing listings
+        top_listings = agent_properties.order_by('-view_count')[:5]
+        top_performing = []
+        for prop in top_listings:
+            top_performing.append({
+                'id': prop.id,
+                'title': prop.title,
+                'views': prop.view_count,
+                'price': prop.price
+            })
+        
+        return Response({
+            'totalListings': total_listings,
+            'totalViews': total_views,
+            'averagePrice': average_price,
+            'listingsByStatus': {
+                'sale': status_data.get('sale', 0),
+                'rent': status_data.get('rent', 0),
+                'buy': status_data.get('buy', 0)
+            },
+            'monthlyViews': monthly_views,
+            'topPerformingListings': top_performing
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@login_required
+def property_stats(request):
+    """Get property statistics"""
+    try:
+        total_properties = Property.objects.count()
+        average_price = Property.objects.aggregate(avg=Avg('price'))['avg'] or 0
+        
+        # Price range
+        price_range = Property.objects.aggregate(
+            min_price=Min('price'),
+            max_price=Max('price')
+        )
+        
+        return Response({
+            'totalProperties': total_properties,
+            'averagePrice': average_price,
+            'priceRange': {
+                'min': price_range['min_price'] or 0,
+                'max': price_range['max_price'] or 0
+            }
+        })
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+# --- File: ./analytics/urls.py ---
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('analytics/summary/', views.analytics_summary, name='analytics_summary'),
+    path('analytics/agent/', views.agent_analytics, name='agent_analytics'),
+    path('analytics/properties/', views.property_stats, name='property_stats'),
+]
+
+
+# --- File: ./analytics/apps.py ---
+from django.apps import AppConfig
+
+
+class AnalyticsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'analytics'
+
+
