@@ -1,0 +1,210 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
+All colors MUST be HSL.
+*/
+
+@layer base {
+  :root {
+    /* Microsoft Edge inspired color palette */
+    --background: 220 20% 97%;
+    --foreground: 220 10% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 220 10% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 10% 15%;
+
+    --primary: 210 100% 50%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 15% 94%;
+    --secondary-foreground: 220 10% 15%;
+
+    --muted: 220 15% 94%;
+    --muted-foreground: 220 10% 50%;
+
+    --accent: 270 80% 58%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 220 15% 90%;
+    --input: 220 15% 90%;
+    --ring: 210 100% 50%;
+
+    --radius: 0.5rem;
+    
+    --success: 142 76% 36%;
+    --warning: 38 92% 50%;
+    --info: 210 100% 50%;
+    
+    /* Browser-like gradients */
+    --gradient-browser: linear-gradient(135deg, hsl(210, 100%, 50%) 0%, hsl(270, 80%, 58%) 50%, hsl(320, 80%, 55%) 100%);
+    --gradient-mesh: radial-gradient(at 0% 0%, hsl(210, 100%, 85%) 0px, transparent 50%),
+                      radial-gradient(at 80% 0%, hsl(270, 80%, 85%) 0px, transparent 50%),
+                      radial-gradient(at 40% 50%, hsl(320, 80%, 85%) 0px, transparent 50%),
+                      radial-gradient(at 100% 100%, hsl(210, 100%, 85%) 0px, transparent 50%);
+    --gradient-glass: linear-gradient(135deg, rgba(255, 255, 255, 0.8) 0%, rgba(255, 255, 255, 0.4) 100%);
+    
+    --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.08);
+    --card-shadow-hover: 0 8px 24px rgba(33, 150, 243, 0.15), 0 4px 8px rgba(0, 0, 0, 0.08);
+    --glass-shadow: 0 8px 32px rgba(33, 150, 243, 0.1);
+    --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-bounce: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 220 10% 15%;
+    --sidebar-primary: 210 100% 50%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 15% 96%;
+    --sidebar-accent-foreground: 220 10% 15%;
+    --sidebar-border: 220 15% 92%;
+    --sidebar-ring: 210 100% 50%;
+  }
+
+  .dark {
+    --background: 220 25% 8%;
+    --foreground: 220 10% 95%;
+
+    --card: 220 22% 12%;
+    --card-foreground: 220 10% 95%;
+
+    --popover: 220 22% 12%;
+    --popover-foreground: 220 10% 95%;
+
+    --primary: 210 100% 55%;
+    --primary-foreground: 220 25% 8%;
+
+    --secondary: 220 20% 18%;
+    --secondary-foreground: 220 10% 95%;
+
+    --muted: 220 20% 18%;
+    --muted-foreground: 220 10% 65%;
+
+    --accent: 270 80% 62%;
+    --accent-foreground: 220 25% 8%;
+
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 220 20% 20%;
+    --input: 220 20% 20%;
+    --ring: 210 100% 55%;
+    
+    --success: 142 76% 42%;
+    --warning: 38 92% 55%;
+    --info: 210 100% 55%;
+    
+    /* Dark mode browser gradients */
+    --gradient-browser: linear-gradient(135deg, hsl(210, 100%, 40%) 0%, hsl(270, 80%, 45%) 50%, hsl(320, 80%, 42%) 100%);
+    --gradient-mesh: radial-gradient(at 0% 0%, hsl(210, 100%, 15%) 0px, transparent 50%),
+                      radial-gradient(at 80% 0%, hsl(270, 80%, 15%) 0px, transparent 50%),
+                      radial-gradient(at 40% 50%, hsl(320, 80%, 15%) 0px, transparent 50%),
+                      radial-gradient(at 100% 100%, hsl(210, 100%, 15%) 0px, transparent 50%);
+    --gradient-glass: linear-gradient(135deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.02) 100%);
+    
+    --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+    --card-shadow-hover: 0 8px 24px rgba(33, 150, 243, 0.3), 0 4px 8px rgba(0, 0, 0, 0.4);
+    --glass-shadow: 0 8px 32px rgba(33, 150, 243, 0.2);
+    
+    --sidebar-background: 220 22% 10%;
+    --sidebar-foreground: 220 10% 95%;
+    --sidebar-primary: 210 100% 55%;
+    --sidebar-primary-foreground: 220 25% 8%;
+    --sidebar-accent: 220 20% 16%;
+    --sidebar-accent-foreground: 220 10% 95%;
+    --sidebar-border: 220 20% 18%;
+    --sidebar-ring: 210 100% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    position: relative;
+    overflow-x: hidden;
+  }
+
+  /* Animated mesh gradient background */
+  body::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--gradient-mesh);
+    animation: mesh-move 20s ease-in-out infinite;
+    z-index: -1;
+    opacity: 0.6;
+  }
+
+  @keyframes mesh-move {
+    0%, 100% {
+      background-position: 0% 0%, 100% 0%, 50% 50%, 100% 100%;
+    }
+    25% {
+      background-position: 100% 0%, 0% 100%, 80% 30%, 20% 70%;
+    }
+    50% {
+      background-position: 50% 100%, 50% 0%, 30% 80%, 70% 20%;
+    }
+    75% {
+      background-position: 0% 100%, 100% 100%, 20% 20%, 80% 80%;
+    }
+  }
+}
+
+@layer components {
+  /* Glass morphism effect */
+  .glass-effect {
+    background: var(--gradient-glass);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+  }
+
+  /* Browser tab effect */
+  .browser-tab {
+    position: relative;
+    padding: 0.5rem 1rem;
+    border-radius: 0.5rem 0.5rem 0 0;
+    transition: var(--transition-smooth);
+  }
+
+  .browser-tab::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--gradient-browser);
+    transform: scaleX(0);
+    transition: transform 0.3s ease;
+  }
+
+  .browser-tab.active::after,
+  .browser-tab:hover::after {
+    transform: scaleX(1);
+  }
+
+  /* Smooth hover scale */
+  .hover-lift {
+    transition: var(--transition-smooth);
+  }
+
+  .hover-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--card-shadow-hover);
+  }
+}
